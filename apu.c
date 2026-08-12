@@ -292,8 +292,15 @@ void apu_reset(apu_t *apu) {
     apu->noise.length_counter = 0;
     apu->dmc.current_length   = 0;
 
-    apu->frame_counter_irq = 0;
+    apu->frame_counter_irq    = 0;
     apu->pending_length_clock = 0;
+
+    // blargg apu_reset / 4017_written: Reset sirasinda son yazilan $4017 degeri
+    // yeniden uygulanir (power-on'da $00, reset'te son yazilan deger).
+    // Re-apply last written $4017 value on reset (same as a $4017 write).
+    apu->frame_counter_mode = (apu->reg_4017_frame_counter >> 7) & 1;
+    apu->reset_delay = (apu->total_cycles & 1) ? 4 : 3;
+
     apu_update_irq_line(apu);
 }
 
@@ -548,6 +555,7 @@ void apu_cpu_write(apu_t *apu, uint16_t addr, uint8_t value) {
                 apu->dmc.dma_request     = 1;
             }
 
+            apu->pending_length_clock = 0;   // FIX: testler arasi sizintiyi onle / prevent cross-test state leak
             apu->dmc.irq_pending = 0;
             apu_update_irq_line(apu);
             break;
@@ -560,6 +568,7 @@ void apu_cpu_write(apu_t *apu, uint16_t addr, uint8_t value) {
                 apu->frame_counter_irq = 0;
                 apu_update_irq_line(apu);
             }
+            apu->pending_length_clock = 0;   // FIX: sequencer reset'te bekleyen length clock'u iptal et / cancel pending length clock on sequencer reset
             apu->reset_delay = (apu->total_cycles & 1) ? 4 : 3;
             break;
     }

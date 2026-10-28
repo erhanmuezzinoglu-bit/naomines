@@ -4,6 +4,7 @@
 #include "apu.h"
 #include "ppu.h"
 #include "exp_config.h"
+#include <string.h>
 
 extern int mapper_irq_pending(void);
 
@@ -24,6 +25,17 @@ static int g_cpu_reset_in_progress = 0;
  * CPU NMI LINE SAMPLING
  * ============================================================ */
 
+#if EXP_ABLATE
+/* SADECE OLCUM (M8/M9): ayni cagrilarla ikinci bir PPU kopyasi de adimlanir; maliyeti
+ * M8-M0 / M9-M4 farkindan okunur. Golge PPU yazmac erisimi almaz (durumu hafifce sapar),
+ * mapper'a ve NMI hattina dokunmaz. */
+int g_ppu_shadow_active = 0;
+static ppu_t g_shadow_ppu;
+static int g_shadow_mode = -1;
+static uint8_t g_shadow_nmi_last;
+static int g_shadow_nmi_pending;
+#endif
+
 void emu_driver_step_ppu_sampled(
     ppu_t *ppu,
     uint32_t cycles)
@@ -33,6 +45,22 @@ void emu_driver_step_ppu_sampled(
     }
 
     ppu_step_sampled(ppu, cycles, &g_nmi_last_sample, &g_nmi_pending);
+
+#if EXP_ABLATE
+    if (EXP_SHADOW_PPU) {
+        if (g_shadow_mode != g_exp_mode) {
+            memcpy(&g_shadow_ppu, ppu, sizeof(g_shadow_ppu));
+            g_shadow_nmi_last = 0;
+            g_shadow_nmi_pending = 0;
+            g_shadow_mode = g_exp_mode;
+        }
+        g_ppu_shadow_active = 1;
+        ppu_step_sampled(&g_shadow_ppu, cycles, &g_shadow_nmi_last, &g_shadow_nmi_pending);
+        g_ppu_shadow_active = 0;
+    } else {
+        g_shadow_mode = -1;
+    }
+#endif
 }
 
 /* ============================================================
@@ -95,7 +123,7 @@ static void step_ppu_with_nmi_probe(
 
 #if EXP_ABLATE
     /* M5-M7 (SADECE OLCUM): PPU adimlama tamamen kapali. */
-    if (g_exp_mode >= 5) {
+    if (EXP_PPU_STEP_OFF) {
         return;
     }
 #endif
@@ -123,7 +151,7 @@ static void lazy_ppu_sync(nes_bus_t *bus, int now)
     if (ticks < 1) ticks = 1;
 #if EXP_ABLATE
     /* SADECE OLCUM: PPU adimlama kapaliyken konum donuktur, olay hesabi anlamsizdir. */
-    if (g_exp_mode >= 5) ticks = 4096;
+    if (EXP_PPU_STEP_OFF) ticks = 4096;
 #endif
     g_ppu_deadline = now + ticks;
 }
@@ -161,7 +189,7 @@ static void lazy_apu_sync(nes_bus_t *bus, int now)
     if (ticks < 1) ticks = 1;
 #if EXP_ABLATE
     /* SADECE OLCUM: APU adimi kapaliyken durum donuktur, olay hesabi anlamsizdir. */
-    if (g_exp_mode == 1 || g_exp_mode >= 4) ticks = 4096;
+    if (EXP_APU_OFF) ticks = 4096;
 #endif
     g_apu_deadline = now + ticks;
 }

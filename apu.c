@@ -913,7 +913,7 @@ void apu_step(apu_t *apu, int cpu_cycles)
 {
 #if EXP_ABLATE
     /* M1/M4 (SADECE OLCUM): APU adimi kapali. */
-    if (g_exp_mode == 1 || g_exp_mode >= 4) return;
+    if (EXP_APU_OFF) return;
 #endif
     int remaining = cpu_cycles;
 

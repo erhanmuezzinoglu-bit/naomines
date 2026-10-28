@@ -94,7 +94,7 @@ static void bench_draw(int y)
 
 static const char *const abl_name[EXP_NMODES] = {
     "base", "noAPU", "noSprPipe", "noLineRnd", "allOff",
-    "noPPUstep", "bypassBus", "CPUonly"
+    "noPPUstep", "bypassBus", "CPUonly", "dupFull", "dupMin"
 };
 static unsigned long abl_us[EXP_NMODES];      /* us / NES frame */
 static int abl_valid[EXP_NMODES];

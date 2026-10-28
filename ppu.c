@@ -21,6 +21,12 @@
 
 /* Mapper kancaları (mapper.c). */
 extern void mapper_scanline_clock(void);
+#if EXP_ABLATE
+extern int g_ppu_shadow_active;    /* golge PPU adimlanirken mapper'a dokunma (SADECE OLCUM) */
+#define MAPPER_CLOCK() do { if (!g_ppu_shadow_active) mapper_scanline_clock(); } while (0)
+#else
+#define MAPPER_CLOCK() mapper_scanline_clock()
+#endif
 
 /* ============================================================
  *  Sanal dot
@@ -210,7 +216,7 @@ static void ppu_a12_check(uint16_t old_v, uint16_t new_v)
 {
     if ((old_v ^ new_v) & 0x1000) {
         if (new_v & 0x1000)
-            mapper_scanline_clock();
+            MAPPER_CLOCK();
     }
 }
 
@@ -463,6 +469,36 @@ static void sprite_fetch_dot(ppu_t *ppu, int sl, int c)
         if (!ppu->oam2_frozen) sprite_oam2_inc(ppu);
         sprite_load_slot(ppu, sl, slot);
     }
+}
+
+/* Bir fetch slotunun TAM 8 dot'u (off 0..7) icin sprite_fetch_dot'un satir satir yansimasi.
+ * vd == 257 (oam2_addr sifirlama) kapsam disi: cagiran yalnizca vd > 257 ve (vd-257)%8==0
+ * icin kullanir. Durum yerel degiskenlerde tutulur; load_slot'tan once geri yazilir. */
+static inline void sprite_fetch_slot_full(ppu_t *ppu, int sl, int slot)
+{
+    uint8_t a = ppu->oam2_addr, fz = ppu->oam2_frozen;
+    uint8_t fb[4] = { ppu->fetch_byte[0], ppu->fetch_byte[1], ppu->fetch_byte[2], ppu->fetch_byte[3] };
+    uint8_t buf = ppu->oam_buffer;
+
+    for (int off = 0; off < 8; off++) {
+        if (fz) {
+            const uint8_t b0 = ppu->sec_oam[0];
+            fb[0] = fb[1] = fb[2] = fb[3] = b0;
+        }
+        if (off < 4) {
+            const uint8_t b = ppu->sec_oam[fz ? 0 : (a & 31)];
+            fb[off] = b;
+            buf = b;
+            if (off < 3 && !fz) { if (++a >= 32) { a = 0; fz = 1; } }
+        } else {
+            buf = fb[3];
+        }
+        if (off == 7 && !fz) { if (++a >= 32) { a = 0; fz = 1; } }
+    }
+
+    ppu->oam2_addr = a; ppu->oam2_frozen = fz; ppu->oam_buffer = buf;
+    ppu->fetch_byte[0] = fb[0]; ppu->fetch_byte[1] = fb[1]; ppu->fetch_byte[2] = fb[2]; ppu->fetch_byte[3] = fb[3];
+    sprite_load_slot(ppu, sl, slot);
 }
 
 #if PPU_EMULATE_OAM_CORRUPTION
@@ -1082,6 +1118,71 @@ static void sps_end_of_fast_line(ppu_t *ppu)
 }
 
 /* ============================================================
+ *  Arka plan satiri: HIZLI surum (render_bg_row ile ayni cikti)
+ *  Kosullar (cagiran saglar): reg_mask & 0x08 (BG acik) ve bg_ev_count == 0.
+ *  Farklar (sonuc ayni): yansitma tablosu (ppu_core_vram_mask switch'i yerine), yerel palet
+ *  tablosu, kenar disi karolarda sinir kontrolsuz 8 piksel, bg_pixels istege bagli (NULL olabilir).
+ * ============================================================ */
+static void render_bg_line_fast(ppu_t *ppu, uint8_t *restrict bg_pixels)
+{
+    scr_pixel_t *restrict dst = &screen_buffer[ppu->scanline * 256];
+
+    uint16_t v       = ppu->line_latched ? ppu->line_v : ppu->v;
+    const uint8_t fine_x = ppu->line_latched ? ppu->line_x : ppu->x;
+    const uint16_t bg_base = (ppu->line_latched ? ppu->line_bg_hi : ((ppu->reg_ctrl & 0x10) != 0))
+                             ? 0x1000 : 0x0000;
+
+    /* palet: indeks (pal_hi<<2 | color); color==0 her zaman palette_ram[0] */
+    scr_pixel_t pal16[16];
+    for (int i = 0; i < 16; i++)
+        pal16[i] = nes_color_to_1555(ppu->palette_ram[(i & 3) ? i : 0]);
+
+    /* nametable yansitma: (addr>>10)&3 -> fiziksel taban */
+    uint16_t nt_base[4];
+    for (int i = 0; i < 4; i++)
+        nt_base[i] = (uint16_t)(ppu_core_vram_mask((uint16_t)(0x2000 + (i << 10)), ppu->mirroring) & 0x0C00);
+
+    const uint8_t *restrict vram = ppu->vram;
+
+    for (int tile = 0; tile < 33; tile++) {
+        const uint16_t nt_addr = 0x2000 | (v & 0x0FFF);
+        const uint8_t tile_idx = vram[0x2000 | nt_base[(nt_addr >> 10) & 3] | (nt_addr & 0x03FF)];
+
+        const uint16_t fine_y = (v >> 12) & 0x07;
+        const uint16_t p_addr = (uint16_t)(bg_base + tile_idx * 16 + fine_y);
+
+        const uint16_t at_addr = 0x23C0 | (v & 0x0C00) | ((v >> 4) & 0x38) | ((v >> 2) & 0x07);
+        const uint8_t attr = vram[0x2000 | nt_base[(at_addr >> 10) & 3] | (at_addr & 0x03FF)];
+        const unsigned hi4 = (unsigned)((attr >> (((v >> 4) & 4) | (v & 2))) & 0x03) << 2;
+
+        const unsigned p0 = vram[p_addr];
+        const unsigned p1 = vram[(uint16_t)(p_addr + 8)];
+
+        const int px0 = tile * 8 - (int)fine_x;
+        if (tile != 0 && tile != 32) {
+            /* tamamen [0,255] icinde */
+            scr_pixel_t *restrict d = dst + px0;
+#define BGPX(K) do { \
+                const unsigned c = ((p0 >> (7 - (K))) & 1u) | (((p1 >> (7 - (K))) & 1u) << 1); \
+                d[(K)] = pal16[c ? (hi4 | c) : 0]; \
+                if (bg_pixels) bg_pixels[px0 + (K)] = (uint8_t)c; \
+            } while (0)
+            BGPX(0); BGPX(1); BGPX(2); BGPX(3); BGPX(4); BGPX(5); BGPX(6); BGPX(7);
+#undef BGPX
+        } else {
+            for (int dot = 0; dot < 8; dot++) {
+                const int px = px0 + dot;
+                if (px < 0 || px >= 256) continue;
+                const unsigned c = ((p0 >> (7 - dot)) & 1u) | (((p1 >> (7 - dot)) & 1u) << 1);
+                dst[px] = pal16[c ? (hi4 | c) : 0];
+                if (bg_pixels) bg_pixels[px] = (uint8_t)c;
+            }
+        }
+        v_inc_coarse_x(&v);
+    }
+}
+
+/* ============================================================
  *  Satır çizimi (dot 256'da)
  * ============================================================ */
 static void render_scanline(ppu_t *ppu) {
@@ -1102,9 +1203,21 @@ static void render_scanline(ppu_t *ppu) {
     }
 
     uint8_t bg_pixels[256];
-    render_bg_row(ppu, bg_pixels, 1, 0);
+
+    /* Sprite'lar kapaliysa veya satirda gecerli sprite yoksa bg_pixels/covered gerekmez. */
+    int any_valid = 0;
+    if (ppu->reg_mask & 0x10) {
+        for (int k = 0; k < 8; k++) any_valid |= ppu->spr_valid[k];
+    }
+
+    if ((ppu->reg_mask & 0x08) && ppu->bg_ev_count == 0) {
+        render_bg_line_fast(ppu, any_valid ? bg_pixels : NULL);
+    } else {
+        render_bg_row(ppu, bg_pixels, 1, 0);
+    }
 
     if (!(ppu->reg_mask & 0x10)) { sps_end_of_fast_line(ppu); return; }
+    if (!any_valid) { sps_end_of_fast_line(ppu); return; }
 
     uint8_t covered[256];
     memset(covered, 0, sizeof(covered));
@@ -1577,7 +1690,7 @@ static inline __attribute__((always_inline)) void ppu_dot(ppu_t *ppu) {
 
             if ((bg_bit == 0 && spr_bit == 1 && ppu->cycle == 258) ||
                 (bg_bit == 1 && spr_bit == 0 && ppu->cycle == 3))
-                mapper_scanline_clock();
+                MAPPER_CLOCK();
         }
 
         if (rendering_v && (ppu->scanline < 240 || ppu->scanline == 261)) {
@@ -1693,37 +1806,161 @@ static inline __attribute__((always_inline)) uint32_t ppu_sprite_bulk(ppu_t *ppu
         return d;
     }
 
-    /* (2) Menzil disi sprite taramasi: tek dot'ta baslayan (vd tek, 67..253) tam cift'ler. */
-    if (cyc >= 64 && cyc <= 250 && !(cyc & 1) && ppu->eval_phase == EVAL_RANGE) {
-        const int vd0 = cyc + PPU_SPRITE_PIPELINE_LEAD;           /* tek */
+    /* (2) Eval penceresi: tek dot'ta baslayan (vd tek, 67..253) tam dot cift'leri, TUM fazlar
+     *     (RANGE / COPY / OVERFLOW / DONE). sprite_eval_dot'un cift-dot mantiginin satir
+     *     satir yansimasi; durum yerel degiskenlerde tutulur, sonunda geri yazilir. */
+#if PPU_OVERFLOW_SET_DELAY == 0
+    if (cyc >= 64 && cyc <= 250 && !(cyc & 1)) {
+        const int vd0 = cyc + PPU_SPRITE_PIPELINE_LEAD;            /* tek */
         uint32_t pairs_max = (uint32_t)((253 - vd0) / 2 + 1);
         if (pairs_max > maxd / 2u) pairs_max = maxd / 2u;
         if (pairs_max == 0) return 0;
 
         const int sl = ppu->scanline;
         const int height = (ppu->reg_ctrl & 0x20) ? 16 : 8;
-        int addr = ppu->oam_addr;
-        uint8_t last = 0;
-        uint32_t pairs = 0;
-        int done = 0;
+        uint8_t phase = ppu->eval_phase;
+        uint8_t eptr = ppu->eval_ptr, copy_left = ppu->eval_copy_left, ovf_left = ppu->eval_ovf_left;
+        uint8_t found = ppu->eval_found, frozen = ppu->oam2_frozen;
+        uint8_t addr = ppu->oam_addr, buf = ppu->oam_buffer;
+        int ovf_flag = 0;
 
-        while (pairs < pairs_max) {
-            const uint8_t sy = oam_read_masked(ppu, (uint8_t)addr);
-            if (spr_in_range(sl, sy, height)) break;             /* menzil icinde: normal yol */
-            last = sy;
-            pairs++;
-            int next = addr + 4;
-            if (next > 0xFF) { done = 1; addr = (next & 0xFF) & 0xFC; break; }
-            addr = next & 0xFC;
+        uint32_t p = 0;
+        while (p < pairs_max) {
+            /* DONE: kalan tum cift'ler kapali formda (addr += 4 / cift, oam_buffer = sec_oam[eval_ptr]) */
+            if (phase == EVAL_DONE) {
+                addr = (uint8_t)(addr + 4u * (pairs_max - p));
+                buf = ppu->sec_oam[eptr & 31];
+                break;
+            }
+
+            /* RANGE: menzil disi cift'ler icin siki ic dongu (oam_buffer son okunan Y, sec_oam[eval_ptr]
+             * son Y'yi tutar; adres +4 / 0xFC maskeli; tasma halinde DONE) */
+            if (phase == EVAL_RANGE) {
+                uint32_t q = 0;
+                uint8_t lastY = 0;
+                while (p + q < pairs_max) {
+                    const uint8_t y2 = oam_read_masked(ppu, addr);
+                    if (spr_in_range(sl, y2, height)) break;
+                    lastY = y2;
+                    q++;
+                    const int nx = addr + 4;
+                    if (nx > 0xFF) { phase = EVAL_DONE; addr = (uint8_t)((nx & 0xFF) & 0xFC); break; }
+                    addr = (uint8_t)(nx & 0xFC);
+                }
+                if (q) {
+                    if (eptr < 32) ppu->sec_oam[eptr] = lastY;
+                    buf = lastY;
+                    p += q;
+                    continue;
+                }
+            }
+
+            /* tek dot: OAM okumasi */
+            if (phase == EVAL_OVERFLOW && ovf_left == 1) buf = ppu->sec_oam[eptr & 31];
+            else buf = oam_read_masked(ppu, addr);
+
+            /* cift dot */
+            const uint8_t sy = buf;
+            const int in_range = spr_in_range(sl, sy, height);
+            int next;
+            int mask_fc = 0;
+
+            switch (phase) {
+            case EVAL_RANGE:
+                if (eptr < 32) ppu->sec_oam[eptr] = sy;
+                if (in_range) {
+                    eptr++;
+                    if (found < 8) found++;
+                    if (found >= 8) frozen = 1;
+                    copy_left = 3;
+                    phase = EVAL_COPY;
+                    next = addr + 1;
+                } else {
+                    next = addr + 4;
+                    mask_fc = 1;
+                }
+                break;
+
+            case EVAL_COPY:
+                if (eptr < 32) ppu->sec_oam[eptr] = sy;
+                eptr++;
+                copy_left--;
+                next = addr + 1;
+                if (copy_left == 0) {
+                    mask_fc = in_range ? 0 : 1;
+                    if (eptr >= 32) { phase = EVAL_OVERFLOW; frozen = 1; }
+                    else            { phase = EVAL_RANGE; }
+                }
+                break;
+
+            case EVAL_OVERFLOW:
+                if (ovf_left) {
+                    ovf_left--;
+                    next = addr + 1;
+                    if (ovf_left == 0) phase = EVAL_DONE;
+                } else if (in_range) {
+                    ovf_flag = 1;                 /* ovf_set_cycle ayni dot'ta tetiklenir (gecikme 0) */
+                    ovf_left = 4;
+                    next = addr + 1;
+                } else {
+                    int n = (addr >> 2) + 1;
+                    int m = ((addr & 3) + 1) & 3;
+                    if (n > 63) { phase = EVAL_DONE; n &= 63; }
+                    next = (n << 2) | m;
+                }
+                buf = ppu->sec_oam[eptr & 31];
+                break;
+
+            default:                              /* DONE (yukarida kapali formda islenir) */
+                addr = (uint8_t)(addr + 4);
+                buf = ppu->sec_oam[eptr & 31];
+                p++;
+                continue;
+            }
+
+            if (next > 0xFF) phase = EVAL_DONE;
+            next &= 0xFF;
+            if (mask_fc) next &= 0xFC;
+            addr = (uint8_t)next;
+            p++;
         }
-        if (pairs == 0) return 0;
 
-        if (ppu->eval_ptr < 32) ppu->sec_oam[ppu->eval_ptr] = last;
-        ppu->oam_buffer = last;
-        ppu->oam_addr = (uint8_t)addr;
-        if (done) ppu->eval_phase = EVAL_DONE;
+        ppu->eval_phase = phase;
+        ppu->eval_ptr = eptr; ppu->eval_copy_left = copy_left; ppu->eval_ovf_left = ovf_left;
+        ppu->eval_found = found; ppu->oam2_frozen = frozen;
+        ppu->oam_addr = addr; ppu->oam_buffer = buf;
+        if (ovf_flag) ppu->reg_status |= 0x20;
 
-        const uint32_t d = pairs * 2u;
+        const uint32_t d = pairs_max * 2u;
+        ppu->cycle = cyc + (int)d;
+        ppu_decay_advance(ppu, d);
+        return d;
+    }
+#endif
+
+    /* (3) Fetch penceresi ve sonrasi (cycle 254..255, 259..335): hizli yol A'nin dot-basi
+     *     merdiveni, genel yuk olmadan. cycle 256/257/258/336 ozel oldugundan disarida. */
+    if ((cyc >= 254 && cyc <= 255) || (cyc >= 259 && cyc <= 335)) {
+        uint32_t d = (cyc <= 255) ? (uint32_t)(256 - cyc) : (uint32_t)(336 - cyc);
+        if (d > maxd) d = maxd;
+        const int sl = ppu->scanline;
+        int vd = cyc + PPU_SPRITE_PIPELINE_LEAD;
+        const int vd_end = vd + (int)d;                          /* disarida */
+        while (vd < vd_end) {
+            if (vd >= 257 && vd <= 320) {
+                if (vd > 257 && ((vd - 257) & 7) == 0 && vd + 8 <= vd_end) {
+                    sprite_fetch_slot_full(ppu, sl, (vd - 257) >> 3);
+                    ppu->oam_addr = 0;
+                    vd += 8;
+                } else {
+                    sprite_fetch_dot(ppu, sl, vd);
+                    ppu->oam_addr = 0;
+                    vd++;
+                }
+            } else {
+                vd++;
+            }
+        }
         ppu->cycle = cyc + (int)d;
         ppu_decay_advance(ppu, d);
         return d;
@@ -1740,7 +1977,7 @@ static inline __attribute__((always_inline)) uint32_t ppu_sprite_bulk(ppu_t *ppu
 static __attribute__((noinline)) uint32_t ppu_bulk(ppu_t *ppu, uint32_t maxd)
 {
 #if EXP_ABLATE
-    if (g_exp_mode >= 5) return 0;
+    if (EXP_PPU_STEP_OFF) return 0;
 #endif
     const int sl = ppu->scanline;
     const int cyc = ppu->cycle;
@@ -1801,7 +2038,9 @@ static inline int ppu_bulk_candidate(const ppu_t *ppu)
 #endif
     const int c = ppu->cycle;
     return (c >= 4 && c <= 61) ||
-           (c >= 64 && c <= 250 && !(c & 1) && ppu->eval_phase == EVAL_RANGE);
+           (c >= 64 && c <= 250 && !(c & 1)) ||
+           (c >= 254 && c <= 255) ||
+           (c >= 259 && c <= 335);
 }
 
 static inline int ppu_nmi_level_inline(const ppu_t *ppu) {
@@ -1858,32 +2097,45 @@ void ppu_step_sampled(ppu_t *ppu, uint32_t cycles, uint8_t *nmi_last, int *nmi_p
     ppu_run(ppu, cycles, nmi_last, nmi_pending);
 }
 
-/* Bir sonraki "CPU'ya asenkron gorunebilen" PPU olayinin, olayi icerisinde yurutecek
- * dot adimi dahil kac dot sonra oldugunu dondurur (>= 1). Olaylar (konum bazli, ppu
- * durumundan bagimsiz, bilincli olarak GENIS bir ust-kume):
- *   - mapper A12 saati adaylari: scanline 0..239 ve 261, cycle 3 ve 258
+/* Bir sonraki "CPU'ya asenkron gorunebilen" PPU olayinin, olayi icerisinde yurutecek dot adimi
+ * dahil kac dot sonra oldugunu dondurur (>= 1). Olaylar:
  *   - VBL bayragi: scanline 241, cycle 1 adimi (adim sonrasi cycle=2)
- * Tekli-frame tek-dot atlamasi (odd frame) en fazla 1 dot sapma yaratir; cagiran
- * taraf bir CPU cycle'lik (3 dot) guvenlik payi birakir. */
+ *   - mapper A12 saati: YALNIZ render aciksa (reg_mask & 0x18) ve gecerli satirlarda (0..239, 261):
+ *       BG=$0000,SPR=$1000 -> cycle 258 ; BG=$1000,SPR=$0000 -> cycle 3 ; diger desenlerde hic.
+ *     reg_mask/reg_ctrl yalniz CPU yazmaclariyla degisir; yazma sonrasi senkron ve deadline
+ *     yeniden hesabi zaten zorunludur, dolayisiyla bu durum-bagimli daraltma guvenlidir.
+ * Tekli-frame tek-dot atlamasi (odd frame) en fazla 1 dot sapma yaratir; cagiran taraf bir CPU
+ * cycle'lik (3 dot) guvenlik payi birakir. */
+static inline int ppu_dots_to(int s, int c, int line, int cyc)
+{
+    int delta = (line - s) * 341 + (cyc - c);
+    if (delta < 0) delta += 262 * 341;
+    return delta + 1;
+}
+
 int ppu_dots_to_next_event(const ppu_t *ppu)
 {
     const int s = ppu->scanline;
     const int c = ppu->cycle;
 
-    if (s < 240 || s == 261) {
-        if (c <= 3)   return 3 - c + 1;
-        if (c <= 258) return 258 - c + 1;
-    }
-    if (s == 241 && c <= 1) return 1 - c + 1;
+    int best = ppu_dots_to(s, c, 241, 1);                          /* VBL */
 
-    int to_line_start = 341 - c;        /* sonraki satirin cycle 0'ina kadar adim */
-    for (int n = 1; n <= 262; n++) {
-        const int s2 = (s + n) % 262;
-        if (s2 < 240 || s2 == 261) return to_line_start + 3 + 1;
-        if (s2 == 241)             return to_line_start + 1 + 1;
-        to_line_start += 341;
+    if (ppu->reg_mask & 0x18) {
+        const int bgb = (ppu->reg_ctrl & 0x10) != 0;
+        const int spb = (ppu->reg_ctrl & 0x08) != 0;
+        const int t = (!bgb && spb) ? 258 : ((bgb && !spb) ? 3 : -1);
+
+        if (t >= 0) {
+            int line = s;
+            if (!(line < 240 || line == 261) || t < c) {
+                line = (s + 1) % 262;
+                while (!(line < 240 || line == 261)) line = (line + 1) % 262;
+            }
+            const int d = ppu_dots_to(s, c, line, t);
+            if (d < best) best = d;
+        }
     }
-    return 1;
+    return best;
 }
 
 void ppu_draw(const ppu_t *ppu) {

@@ -54,27 +54,33 @@
  *   M1: APU adimi kapali                                  -> APU payi      = M0-M1
  *   M2: PPU sprite pipeline kapali                        -> sprite payi   = M0-M2
  *   M3: PPU satir cizicisi (render_scanline) kapali       -> cizici payi   = M0-M3
- *   M4: M1+M2+M3 (APU + sprite + cizici kapali)           -> kalan PPU     = M4-M5
+ *   M4: M1+M2+M3 (APU + sprite + cizici kapali)           -> kalan PPU     = M4-M5 (CPU is yuku farki da icerir!)
  *   M5: M4 + PPU adimlama tamamen kapali (CPU+bus+surucu; oyun vblank'ta bekler)
  *   M6: M5 + nes_bus_read/write dagitimi atlanir (RAM/PRG dogrudan)
  *   M7: M6 + surucu sarmalayicisi (DMC/PPU/APU sync, IRQ snapshot) atlanir = CPU cekirdegi
- */
+ *   M8: M0 + "golge PPU": ayni cagrilarla ikinci bir PPU kopyasi de adimlanir -> M8-M0 = TAM PPU adimlama maliyeti
+ *       (CPU is yuku farkindan bagimsiz, dogrudan olcum)
+ *   M9: M4 + golge PPU                                     -> M9-M4 = "olay-yalniz" PPU adimlama maliyeti
+  */
 #ifndef EXP_ABLATE
-#define EXP_ABLATE 0
+#define EXP_ABLATE 1
 #endif
 
 #if EXP_ABLATE && !EXP_PROFILE
 #error "EXP_ABLATE icin EXP_PROFILE=1 gerekli"
 #endif
 
-#define EXP_NMODES 8
+#define EXP_NMODES 10
 
 #if EXP_ABLATE
 extern int g_exp_mode;
-#define EXP_SPR_PIPE_ON   (g_exp_mode != 2 && g_exp_mode != 4)
-#define EXP_LINE_RENDER_ON (g_exp_mode != 3 && g_exp_mode != 4)
+#define EXP_APU_OFF        (g_exp_mode == 1 || g_exp_mode == 4 || (g_exp_mode >= 5 && g_exp_mode <= 7) || g_exp_mode == 9)
+#define EXP_PPU_STEP_OFF   (g_exp_mode >= 5 && g_exp_mode <= 7)
+#define EXP_SPR_PIPE_ON    (g_exp_mode != 2 && g_exp_mode != 4 && g_exp_mode != 9)
+#define EXP_LINE_RENDER_ON (g_exp_mode != 3 && g_exp_mode != 4 && g_exp_mode != 9)
+#define EXP_SHADOW_PPU     (g_exp_mode == 8 || g_exp_mode == 9)
 #else
-#define EXP_SPR_PIPE_ON   1
+#define EXP_SPR_PIPE_ON    1
 #define EXP_LINE_RENDER_ON 1
 #endif
 

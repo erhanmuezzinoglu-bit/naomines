@@ -26,6 +26,14 @@ static nes_bus_t bus;
 
 #if EXP_ABLATE
 int g_exp_mode = 0;
+extern unsigned long g_ps_calls, g_ps_dots, g_ps_c3, g_ps_small, g_ps_slow, g_ps_bulk_calls, g_ps_bulk_dots;
+extern unsigned long g_ps_s0, g_ps_bgrow, g_ps_dotwise, g_ps_cyc[7];
+#define PS_N 17
+static unsigned long ps_acc[2][PS_N];       /* [0]: M0, [1]: M4 */
+static int ps_n[2];
+static unsigned long ps_avg[2][PS_N];
+#define PS_SNAP(a) do { (a)[0]=g_ps_calls; (a)[1]=g_ps_dots; (a)[2]=g_ps_c3; (a)[3]=g_ps_small; (a)[4]=g_ps_slow; (a)[5]=g_ps_bulk_calls; (a)[6]=g_ps_bulk_dots; \
+    (a)[7]=g_ps_s0; (a)[8]=g_ps_bgrow; (a)[9]=g_ps_dotwise; for (int q_=0;q_<7;q_++) (a)[10+q_]=g_ps_cyc[q_]; } while (0)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -224,6 +232,10 @@ int main(void)
         else
         {
             /* ---- Emulasyon ---- */
+#if EXP_ABLATE
+            const int mode_at_start = g_exp_mode;
+            unsigned long ps0[PS_N]; PS_SNAP(ps0);
+#endif
             p = profile_start_if();
             if (in.edge.player1.button6) {
                 for (int i = 0; i < 8; i++) emu_driver_step_1();
@@ -249,6 +261,18 @@ int main(void)
                 }
             }
             profile_end_into(p, &t_emu);
+#if EXP_ABLATE
+            if (autorun && (mode_at_start == 0 || mode_at_start == 4)) {
+                const int mi = (mode_at_start == 0) ? 0 : 1;
+                unsigned long ps1[PS_N]; PS_SNAP(ps1);
+                for (int q = 0; q < PS_N; q++) ps_acc[mi][q] += ps1[q] - ps0[q];
+                if (++ps_n[mi] >= 4) {
+                    for (int q = 0; q < PS_N; q++) ps_avg[mi][q] = ps_acc[mi][q] / (unsigned long)(ps_n[mi] * EXP_TURBO_FRAMES);
+                    for (int q = 0; q < PS_N; q++) ps_acc[mi][q] = 0;
+                    ps_n[mi] = 0;
+                }
+            }
+#endif
 
             /* ---- Ses ---- */
             p = profile_start_if();
@@ -311,6 +335,18 @@ int main(void)
 #endif
 #if EXP_BENCH
             bench_draw(392);
+#endif
+#if EXP_ABLATE
+            for (int mi = 0; mi < 2; mi++) {
+                const unsigned long *a_ = ps_avg[mi];
+                video_draw_debug_text(
+                    8, 404 + mi * 24, rgb(255, 170, 170),
+                    "M%d cagri:%lu dot:%lu slow:%lu bulk:%lu/%lu 3dot:%lu kucuk:%lu\n"
+                    " spr0:%lu bg:%lu dw:%lu | c0=%lu c1=%lu c23=%lu c252=%lu c336=%lu dgr=%lu vbl=%lu",
+                    mi ? 4 : 0, a_[0], a_[1], a_[4], a_[5], a_[6], a_[2], a_[3],
+                    a_[7], a_[8], a_[9],
+                    a_[10], a_[11], a_[12], a_[13], a_[14], a_[15], a_[16]);
+            }
 #endif
         }
 

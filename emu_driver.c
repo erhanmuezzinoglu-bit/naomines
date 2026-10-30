@@ -172,6 +172,17 @@ void emu_driver_sync_ppu(void)
     }
 }
 
+#if EXP_LAZY_PPU
+/* Komut sonu / donus noktasi: deadline'a ulasildiysa (bir sonraki bus cycle'inda
+ * zaten senkron gerekecekti) PPU'yu simdi senkronla ve deadline'i yenile. */
+static inline void ppu_sync_if_due(void)
+{
+    if ((int32_t)((uint32_t)g_cpu->emu.clockticks - (uint32_t)g_ppu_deadline) >= 0) {
+        lazy_ppu_sync(g_bus, g_cpu->emu.clockticks);
+    }
+}
+#endif
+
 #if EXP_LAZY_APU
 /* APU'nun bir sonraki "CPU'ya gorunebilen" olayinin CPU cycle'i (mutlak). */
 static int g_apu_deadline = 0;
@@ -601,6 +612,13 @@ uint32_t emu_driver_step_1(void)
     int ticks_after = g_cpu->emu.clockticks;
     int cpu_cycles = ticks_after - ticks_before;
 
+#if EXP_LAZY_PPU
+    /* Tembel PPU: komut sonunda yalniz bir sonraki gorunur olayin deadline'ina
+     * ulasildiysa senkronla. Deadline'a ulasilmadiysa PPU'nun disariya gorunen
+     * hicbir durumu (NMI/IRQ kenari, mapper saati, yazmac) degisemez; bekleyen
+     * dot'lar bir sonraki erisimde/deadline'da toplu calisir. */
+    ppu_sync_if_due();
+#else
     int final_ppu_sync =
         g_cpu->emu.clockticks -
         g_bus->last_ppu_sync_tick;
@@ -614,6 +632,7 @@ uint32_t emu_driver_step_1(void)
         g_bus->last_ppu_sync_tick =
             g_cpu->emu.clockticks;
     }
+#endif
 
     if (g_nmi_ready &&
         !g_cpu->emu.nmi_defer_after_interrupt) {
@@ -658,6 +677,10 @@ uint32_t emu_driver_step_1(void)
     }
 #endif
 
+#if EXP_LAZY_PPU
+    ppu_sync_if_due();
+#else
     emu_driver_sync_ppu();
+#endif
     return cpu_cycles;
 }

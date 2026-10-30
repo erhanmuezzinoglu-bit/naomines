@@ -15,6 +15,16 @@
 #include "ppu.h"
 #include "nes_rom.h"
 #include "exp_config.h"
+
+#if EXP_ABLATE
+/* SADECE OLCUM: gercek oyunda PPU adimlamanin cagri/dot istatistigi (tam sayim, zamanlama yok). */
+unsigned long g_ps_calls, g_ps_dots, g_ps_c3, g_ps_small, g_ps_slow, g_ps_bulk_calls, g_ps_bulk_dots;
+unsigned long g_ps_s0, g_ps_bgrow, g_ps_dotwise;      /* agir fonksiyon cagrilari */
+unsigned long g_ps_cyc[7];                             /* yavas dot'lar: cycle sinifina gore */
+#define PS_STAT(x) (x)
+#else
+#define PS_STAT(x) ((void)0)
+#endif
 #include <naomi/video.h>
 #include <string.h>
 #include <stdbool.h>
@@ -525,6 +535,7 @@ static void oam_corrupt_apply(ppu_t *ppu)
  * ============================================================ */
 static void render_bg_row(ppu_t *ppu, uint8_t bg_pixels[256], int draw, int force_bg)
 {
+    PS_STAT(g_ps_bgrow++);
     memset(bg_pixels, 0, 256);
 
     if (!force_bg && !(ppu->reg_mask & 0x08)) {
@@ -600,6 +611,7 @@ static void sprite0_schedule_hit(ppu_t *ppu, int dot_now)
     if ((ppu->reg_mask & 0x18) != 0x18) return;
     if (ppu->reg_status & 0x40) return;
 
+    PS_STAT(g_ps_s0++);
     int age_now = ppu->render_age;
     uint8_t bg[256];
     render_bg_row(ppu, bg, 0, 1);
@@ -764,6 +776,7 @@ static void bg_standard_start(const ppu_t *ppu, ppu_bgstate_t *bs)
 
 static void render_line_dotwise(ppu_t *ppu, int draw, int *hit_x)
 {
+    PS_STAT(g_ps_dotwise++);
     if (hit_x) *hit_x = -1;
 
     ppu_bgstate_t bs;
@@ -2056,6 +2069,19 @@ static __attribute__((noinline)) void ppu_run(
     const uint32_t grouped = nmi_last ? (cycles - (cycles % 3u)) : 0u;
     uint32_t k = 0;
 
+#if EXP_ABLATE
+    /* SADECE OLCUM: sprite pipeline kapaliyken eski sprite durumu (spr0_line / spr_valid) kalmasin;
+     * aksi halde sprite0_schedule_hit her satirda tam bg satiri cizer (olcum artefakti). */
+    if (!EXP_SPR_PIPE_ON) {
+        ppu->spr0_line = 0;
+        for (int q = 0; q < 8; q++) ppu->spr_valid[q] = 0;
+    }
+#endif
+    PS_STAT(g_ps_calls++);
+    PS_STAT(g_ps_dots += cycles);
+    if (cycles == 3u)      { PS_STAT(g_ps_c3++); }
+    else if (cycles < 30u) { PS_STAT(g_ps_small++); }
+
     for (uint32_t i = 0; i < cycles; ) {
         /* Toplu yollar: NMI seviyesi orneklemeyi etkilemeyecekse (seviye == son ornek; bu
          * dot'lar boyunca seviye degisemez) bir dizi dot tek seferde calistirilir. */
@@ -2063,6 +2089,8 @@ static __attribute__((noinline)) void ppu_run(
             (!nmi_last || ppu_nmi_level_inline(ppu) == (int)*nmi_last)) {
             const uint32_t d = ppu_bulk(ppu, cycles - i);
             if (d) {
+                PS_STAT(g_ps_bulk_calls++);
+                PS_STAT(g_ps_bulk_dots += d);
                 if (i < grouped) {
                     uint32_t in_g = grouped - i;
                     if (in_g > d) in_g = d;
@@ -2073,6 +2101,15 @@ static __attribute__((noinline)) void ppu_run(
             }
         }
 
+        PS_STAT(g_ps_slow++);
+#if EXP_ABLATE
+        {
+            const int cc = ppu->cycle;
+            g_ps_cyc[ppu->scanline >= 240 ? 6 :
+                     cc == 0 ? 0 : cc == 1 ? 1 : cc <= 3 ? 2 : (cc >= 252 && cc <= 258) ? 3 :
+                     cc >= 336 ? 4 : 5]++;
+        }
+#endif
         ppu_dot(ppu);
 
         if (i < grouped) {

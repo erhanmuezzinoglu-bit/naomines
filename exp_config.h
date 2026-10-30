@@ -63,7 +63,7 @@
  *   M9: M4 + golge PPU                                     -> M9-M4 = "olay-yalniz" PPU adimlama maliyeti
   */
 #ifndef EXP_ABLATE
-#define EXP_ABLATE 1
+#define EXP_ABLATE 0
 #endif
 
 #if EXP_ABLATE && !EXP_PROFILE

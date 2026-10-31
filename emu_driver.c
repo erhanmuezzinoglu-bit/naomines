@@ -78,6 +78,11 @@ static void dmc_after_cpu_cycle(
 
     dmc_t *d = &bus->apu.dmc;
 
+    /* Asagidaki iki kol da d->dma_request != 0 gerektirir: DMC istegi yokken hicbir sey yapmaz. */
+    if (!d->dma_request) {
+        return;
+    }
+
     int implicit_pending =
         (d->dma_delay_parity & 0xFEu) ==
         DMC_DMA_RUNTIME_IMPLICIT_PENDING_BASE;
@@ -133,10 +138,25 @@ static void step_ppu_with_nmi_probe(
     emu_driver_step_ppu_sampled(ppu, cycles);
 }
 
+/* Tembel senkron deadline'lari (mutlak CPU cycle). cpu_fast.h (cekirdege gomulu hizli bus yolu)
+ * ikisini tek karsilastirmayla kontrol etmek icin g_dl_min = min(ppu, apu) tutar; deadline'i
+ * degistiren HER atama DL_REFRESH() ile biter. */
+#if EXP_LAZY_PPU
+int g_ppu_deadline = 0;
+#endif
+#if EXP_LAZY_APU
+int g_apu_deadline = 0;
+#endif
+#if EXP_LAZY_PPU && EXP_LAZY_APU
+int g_dl_min = 0;
+#define DL_REFRESH() (g_dl_min = ((int32_t)((uint32_t)g_ppu_deadline - (uint32_t)g_apu_deadline) < 0) ? g_ppu_deadline : g_apu_deadline)
+#else
+#define DL_REFRESH() ((void)0)
+#endif
+
 #if EXP_LAZY_PPU
 /* PPU'nun bir sonraki "disariya gorunur" olayinin CPU cycle'i (mutlak). Olay,
  * o cycle'in senkronunda calisir; bir CPU cycle erken uyanma payi birakilir. */
-static int g_ppu_deadline = 0;
 
 static void lazy_ppu_sync(nes_bus_t *bus, int now)
 {
@@ -153,7 +173,7 @@ static void lazy_ppu_sync(nes_bus_t *bus, int now)
     /* SADECE OLCUM: PPU adimlama kapaliyken konum donuktur, olay hesabi anlamsizdir. */
     if (EXP_PPU_STEP_OFF) ticks = 4096;
 #endif
-    g_ppu_deadline = now + ticks;
+    g_ppu_deadline = now + ticks; DL_REFRESH();
 }
 #endif
 
@@ -177,6 +197,15 @@ void emu_driver_sync_ppu(void)
  * zaten senkron gerekecekti) PPU'yu simdi senkronla ve deadline'i yenile. */
 static inline void ppu_sync_if_due(void)
 {
+#if EXP_ABLATE
+    /* SADECE OLCUM (M5-M7): PPU adimlama kapaliyken eski davranis korunur: her komut sonunda
+     * last_ppu_sync_tick isaretlenir (adim bastirilmis olsa da). Aksi halde PPU yazmac erisimlerinde
+     * uzun aralik tek seferde adimlanir ve "oyun vblank'ta bekler" olcum varsayimi bozulur. */
+    if (EXP_PPU_STEP_OFF) {
+        emu_driver_sync_ppu();
+        return;
+    }
+#endif
     if ((int32_t)((uint32_t)g_cpu->emu.clockticks - (uint32_t)g_ppu_deadline) >= 0) {
         lazy_ppu_sync(g_bus, g_cpu->emu.clockticks);
     }
@@ -185,7 +214,6 @@ static inline void ppu_sync_if_due(void)
 
 #if EXP_LAZY_APU
 /* APU'nun bir sonraki "CPU'ya gorunebilen" olayinin CPU cycle'i (mutlak). */
-static int g_apu_deadline = 0;
 
 static void lazy_apu_sync(nes_bus_t *bus, int now)
 {
@@ -202,9 +230,29 @@ static void lazy_apu_sync(nes_bus_t *bus, int now)
     /* SADECE OLCUM: APU adimi kapaliyken durum donuktur, olay hesabi anlamsizdir. */
     if (EXP_APU_OFF) ticks = 4096;
 #endif
-    g_apu_deadline = now + ticks;
+    g_apu_deadline = now + ticks; DL_REFRESH();
 }
 #endif
+
+/* DMA'da calinan bir cycle'in sonunda (clockticks artirildi): bus cycle'indaki gibi yalniz
+ * deadline'i gelen tembel bilesenleri senkronla. Tembel olmayan bilesenler nes_bus.c'de
+ * cycle basina senkronlanir. */
+void emu_driver_dma_cycle_events(void)
+{
+#if EXP_LAZY_PPU || EXP_LAZY_APU
+    const int now = g_cpu->emu.clockticks;
+#endif
+#if EXP_LAZY_PPU
+    if ((int32_t)((uint32_t)now - (uint32_t)g_ppu_deadline) >= 0) {
+        lazy_ppu_sync(g_bus, now);
+    }
+#endif
+#if EXP_LAZY_APU
+    if ((int32_t)((uint32_t)now - (uint32_t)g_apu_deadline) >= 0) {
+        lazy_apu_sync(g_bus, now);
+    }
+#endif
+}
 
 void emu_driver_sync_apu(void)
 {
@@ -272,7 +320,7 @@ uint8_t fake6502_mem_read(
         bus->last_cpu_read_addr = address;
         nes_bus_dma_dmc_step(bus, c);
 #if EXP_LAZY_APU
-        g_apu_deadline = 0;
+        g_apu_deadline = 0; DL_REFRESH();
 #endif
     }
 
@@ -332,7 +380,7 @@ uint8_t fake6502_mem_read(
     /* APU yazmaci/durumu okundu ($4000-$401F): bekleyen bayrak olusmus olabilir, bir
      * sonraki cycle'da senkronla ve olay hesabini tazele. */
     if (address >= 0x4000 && address <= 0x401F) {
-        g_apu_deadline = c->emu.clockticks + 1;
+        g_apu_deadline = c->emu.clockticks + 1; DL_REFRESH();
     }
 #endif
 
@@ -441,7 +489,7 @@ void fake6502_mem_write(
 
 #if EXP_LAZY_APU
     if (address >= 0x4000 && address <= 0x401F) {
-        g_apu_deadline = c->emu.clockticks + 1;
+        g_apu_deadline = c->emu.clockticks + 1; DL_REFRESH();
     }
 #endif
 
@@ -449,7 +497,7 @@ void fake6502_mem_write(
     /* PPU yazmaci yazildi (ornegin $2000 ile NMI acildi): olasi yukselen kenar, eager
      * surucuyle ayni cycle'da yakalansin diye bir sonraki cycle'da senkronla. */
     if (address >= 0x2000 && address <= 0x3FFF) {
-        g_ppu_deadline = c->emu.clockticks + 1;
+        g_ppu_deadline = c->emu.clockticks + 1; DL_REFRESH();
     }
 #endif
 
@@ -491,10 +539,10 @@ void emu_driver_init(
     g_nmi_ready = 0;
     g_nmi_last_sample = 0;
 #if EXP_LAZY_PPU
-    g_ppu_deadline = 0;
+    g_ppu_deadline = 0; DL_REFRESH();
 #endif
 #if EXP_LAZY_APU
-    g_apu_deadline = 0;
+    g_apu_deadline = 0; DL_REFRESH();
 #endif
 }
 
@@ -540,10 +588,10 @@ void emu_driver_reset_from_vector(void)
     }
 
 #if EXP_LAZY_PPU
-    g_ppu_deadline = 0;
+    g_ppu_deadline = 0; DL_REFRESH();
 #endif
 #if EXP_LAZY_APU
-    g_apu_deadline = 0;
+    g_apu_deadline = 0; DL_REFRESH();
 #endif
     g_cpu_reset_in_progress = 1;
     fake6502_reset(g_cpu);
@@ -605,7 +653,7 @@ uint32_t emu_driver_step_1(void)
         emu_driver_sync_ppu();
         nes_bus_oam_dma_step(g_bus, g_cpu);
 #if EXP_LAZY_APU
-        g_apu_deadline = 0;
+        g_apu_deadline = 0; DL_REFRESH();
 #endif
     }
 

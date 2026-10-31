@@ -42,6 +42,36 @@ static void sync_ppu(
     }
 }
 
+/* ---- DMA cycle senkronu (tembel modlarda) ----
+ * Tembel PPU/APU'da DMA'nin her calinan cycle'inda PPU/APU'yu adim adim calistirmak yerine, bus
+ * cycle'indaki gibi yalniz deadline'i gelen bilesen senkronlanir (emu_driver_dma_cycle_events);
+ * PPU/APU'ya GORUNEN her erisimden (yazmac okuma/yazma, DMC durum degisikligi) ONCE ilgili bilesen
+ * o cycle'a kadar senkronlanir, DMA bitiminde (zorla last_*_sync_tick atamasindan once) ikisi de
+ * tam senkronlanir. Tembel olmayan yapilandirmada eski cycle-basi senkron aynen kalir. */
+#if EXP_LAZY_PPU
+#define DMA_TICK_PPU() ((void)0)
+#else
+#define DMA_TICK_PPU() sync_ppu(bus, ctx)
+#endif
+#if EXP_LAZY_APU
+#define DMA_TICK_APU() ((void)0)
+#else
+#define DMA_TICK_APU() sync_apu(bus, ctx)
+#endif
+#define DMA_TICK() do { DMA_TICK_PPU(); DMA_TICK_APU(); emu_driver_dma_cycle_events(); } while (0)
+
+#if EXP_LAZY_PPU || EXP_LAZY_APU
+#define DMA_SYNC_ALL()      do { sync_ppu(bus, ctx); sync_apu(bus, ctx); } while (0)
+#define DMA_SYNC_PPU()      sync_ppu(bus, ctx)
+#define DMA_SYNC_APU()      sync_apu(bus, ctx)
+#define DMA_SYNC_ACCESS(a)  do { if ((a) >= 0x2000u && (a) < 0x8000u) DMA_SYNC_ALL(); } while (0)
+#else
+#define DMA_SYNC_ALL()      ((void)0)
+#define DMA_SYNC_PPU()      ((void)0)
+#define DMA_SYNC_APU()      ((void)0)
+#define DMA_SYNC_ACCESS(a)  ((void)0)
+#endif
+
 void nes_bus_init(
     nes_bus_t *bus,
     ppu_t *ppu,
@@ -183,8 +213,8 @@ static void dma_cycle_advance(
     fake6502_context *ctx)
 {
     ctx->emu.clockticks++;
-    sync_ppu(bus, ctx);
-    sync_apu(bus, ctx);
+    (void)bus;
+    DMA_TICK();
 }
 
 static void nes_bus_dmc_complete_get(
@@ -351,9 +381,14 @@ void nes_bus_oam_dma_step(
 
         if (dmc_get_now) {
             if (oam_state == OAM_DMA_RUNTIME_PUT) {
+                DMA_SYNC_PPU();
                 ppu_cpu_write(bus->ppu, 0x2004, oam_data);
             }
 
+            /* DMC durumu degisiyor: APU bu cycle'a kadar senkron olmali; halted adres yazmac
+             * alaninda ise cakisma okumalari PPU/APU yazmaclarina dokunur. */
+            DMA_SYNC_APU();
+            DMA_SYNC_ACCESS(parked_cpu_addr);
             nes_bus_dmc_complete_get(
                 bus, parked_cpu_addr, dmc_sample_addr
             );
@@ -363,6 +398,7 @@ void nes_bus_oam_dma_step(
                 case OAM_DMA_RUNTIME_HALT:
                 case OAM_DMA_RUNTIME_ALIGNMENT:
                     bus->last_cpu_read_addr = parked_cpu_addr;
+                    DMA_SYNC_ACCESS(parked_cpu_addr);
                     (void)nes_bus_read_raw(
                         bus, parked_cpu_addr
                     );
@@ -370,6 +406,8 @@ void nes_bus_oam_dma_step(
 
                 case OAM_DMA_RUNTIME_GET:
                     if (!oam_get_stolen) {
+                        DMA_SYNC_ACCESS(parked_cpu_addr);
+                        DMA_SYNC_ACCESS((uint16_t)(base + oam_index));
                         oam_data =
                             nes_bus_oam_source_read(
                                 bus,
@@ -381,6 +419,7 @@ void nes_bus_oam_dma_step(
                     break;
 
                 case OAM_DMA_RUNTIME_PUT:
+                    DMA_SYNC_PPU();
                     ppu_cpu_write(
                         bus->ppu, 0x2004, oam_data
                     );
@@ -447,6 +486,7 @@ void nes_bus_oam_dma_step(
     }
 
     bus->last_cpu_read_addr = parked_cpu_addr;
+    DMA_SYNC_ALL();
     bus->last_apu_sync_tick = ctx->emu.clockticks;
     bus->last_ppu_sync_tick = ctx->emu.clockticks;
 }
@@ -620,8 +660,7 @@ void nes_bus_dma_dmc_step(
 
     for (int i = 0; i < dma_cycles - 1; i++) {
         ctx->emu.clockticks++;
-        sync_ppu(bus, ctx);
-        sync_apu(bus, ctx);
+        DMA_TICK();
 
         if (d->dma_delay_parity ==
             DMC_DMA_RUNTIME_IMPLICIT_ACTIVE) {
@@ -629,6 +668,7 @@ void nes_bus_dma_dmc_step(
             if (i == 0) {
                 d->dma_delay_parity = 0;
                 bus->last_cpu_read_addr = halted_addr;
+                DMA_SYNC_ALL();
                 bus->last_apu_sync_tick = ctx->emu.clockticks;
                 bus->last_ppu_sync_tick = ctx->emu.clockticks;
                 return;
@@ -642,6 +682,7 @@ void nes_bus_dma_dmc_step(
             if (i == 0) {
                 d->dma_delay_parity = 0;
                 bus->last_cpu_read_addr = halted_addr;
+                DMA_SYNC_ALL();
                 bus->last_apu_sync_tick = ctx->emu.clockticks;
                 bus->last_ppu_sync_tick = ctx->emu.clockticks;
                 return;
@@ -652,10 +693,12 @@ void nes_bus_dma_dmc_step(
         }
 
         bus->last_cpu_read_addr = halted_addr;
+        DMA_SYNC_ACCESS(halted_addr);
         (void)nes_bus_read_raw(bus, halted_addr);
     }
 
     ctx->emu.clockticks++;
+    /* Son cycle: DMC durumu degisecek ve d->timer/bit_count okunacak: tam senkron (eski davranis). */
     sync_ppu(bus, ctx);
     sync_apu(bus, ctx);
 

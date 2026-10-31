@@ -1,7 +1,7 @@
 # Nihai ürünün adı
 all: naomines.bin
 
-# Kaynak dosyalar.
+# Kaynak dosyalar (.c)
 SRCS += main.c
 SRCS += apu.c
 SRCS += nes_input.c
@@ -14,10 +14,41 @@ SRCS += debug_hud.c
 SRCS += ppu.c
 SRCS += mapper.c
 
+# Görseller ve Font (Ana klasörde olmalı)
+SRCS += background.png
+SRCS += dejavusans.ttf
+SRCS += frame_blue.png
+SRCS += frame_side.png
+SRCS += cover_mario.png
+SRCS += cover_zelda.png
+SRCS += cover_castlevania.png
+SRCS += cover_punchout.png
+SRCS += cover_smb3.png
+
 # Temel kurallar ve tool/parametreler
 include ../../Makefile.base
 
-# ROMFS image (romfs/ altını otomatik image yapar)
+# Sprite Kütüphanesi
+LIBS += -lnaomisprite
+
+# FreeType ve Bağımlılıkları
+ifeq (${FEATURE_FREETYPE}, 1)
+LIBS += -lfreetype -lbz2 -lz -lpng16
+endif
+
+# PNG -> C -> Object derleme kuralı
+build/%.o: %.png ${IMG2C_FILE}
+	@mkdir -p $(dir $@)
+	${IMG2C} build/$<.c --mode RGBA4444 $<
+	${CC} -c build/$<.c -o $@
+
+# TTF -> C -> Object derleme kuralı
+build/%.o: %.ttf ${IMG2C_FILE}
+	@mkdir -p $(dir $@)
+	${IMG2C} build/$<.c $<
+	${CC} -c build/$<.c -o $@
+
+# ROMFS image
 build/romfs.bin: romfs/ ${ROMFSGEN_FILE}
 	${ROMFSGEN} $@ $<
 

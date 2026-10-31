@@ -20,6 +20,9 @@ void emu_driver_sync_ppu(void);
 /* APU'yu mevcut CPU cycle'ina kadar senkronla (tembel modda bekleyen cycle'lari calistirir). */
 void emu_driver_sync_apu(void);
 
+/* DMA'da calinan cycle sonrasi: deadline'i gelen tembel PPU/APU olaylarini isle. */
+void emu_driver_dma_cycle_events(void);
+
 void emu_driver_init(fake6502_context *cpu,
                      ppu_t *ppu,
                      nes_input_t *in,

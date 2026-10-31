@@ -16,6 +16,12 @@
 #include "nes_rom.h"
 #include "exp_config.h"
 
+/* 1: ppu_dot hizli yol A, cycle 3/256/257/258 ozel dot'larini da kapsar (orijinal govdenin ayni isini
+ * ayni sirayla yapar). 0: eski davranis (bu dot'lar orijinal govdeden gecer). Dogrulama referansi. */
+#ifndef PPU_FAST_SPECIAL
+#define PPU_FAST_SPECIAL 1
+#endif
+
 #if EXP_ABLATE
 /* SADECE OLCUM: gercek oyunda PPU adimlamanin cagri/dot istatistigi (tam sayim, zamanlama yok). */
 unsigned long g_ps_calls, g_ps_dots, g_ps_c3, g_ps_small, g_ps_slow, g_ps_bulk_calls, g_ps_bulk_dots;
@@ -1499,8 +1505,20 @@ static inline __attribute__((always_inline)) void ppu_dot(ppu_t *ppu) {
             !ppu->oam_corrupt_pending &&
             !ppu->ovf_set_cycle && !ppu->spr0_hit_cycle) {
             const int cyc = ppu->cycle;
+#if PPU_FAST_SPECIAL
+            /* Yalniz cycle 1 (satir basi blogu) yavas yolda kalir. 3/256/257/258 icin orijinal govdenin
+             * (render acik, render_age doymus => rendering_v dogru) yaptigi ek isler asagida, ayni sirayla. */
+            if (cyc != 1) {
+#else
             if (cyc != 1 && cyc != 3 && cyc != 256 && cyc != 257 && cyc != 258) {
+#endif
                 int vsl, vd;
+#if PPU_FAST_SPECIAL
+                /* orijinal govde: cycle 256'da sprite asamasindan ONCE satiri ciz */
+                if (EXP_LINE_RENDER_ON && cyc == 256) {
+                    render_scanline(ppu);
+                }
+#endif
                 spr_virtual_dot(ppu->scanline, cyc, &vsl, &vd);
 
                 if (vd == 339 && (vsl < 240 || vsl == 261)) {
@@ -1522,6 +1540,21 @@ static inline __attribute__((always_inline)) void ppu_dot(ppu_t *ppu) {
                     if (vd >= 257 && vd <= 320) ppu->oam_addr = 0;
                 }
 
+#if PPU_FAST_SPECIAL
+                /* orijinal govde: sprite asamasindan SONRA mapper A12 saati, sonra v guncellemeleri. */
+                if (cyc == 258 || cyc == 3) {
+                    const int bg_bit  = (ppu->reg_ctrl & 0x10) ? 1 : 0;
+                    const int spr_bit = (ppu->reg_ctrl & 0x08) ? 1 : 0;
+                    if ((bg_bit == 0 && spr_bit == 1 && cyc == 258) ||
+                        (bg_bit == 1 && spr_bit == 0 && cyc == 3))
+                        MAPPER_CLOCK();
+                } else if (cyc == 256) {
+                    v_inc_y(&ppu->v);
+                } else if (cyc == 257) {
+                    ppu->v = (ppu->v & ~0x041F) | (ppu->t & 0x041F);
+                }
+#endif
+
                 if (++ppu->cycle >= 341) {
                     ppu->cycle = 0;
                     ppu->scanline++;
@@ -1534,6 +1567,14 @@ static inline __attribute__((always_inline)) void ppu_dot(ppu_t *ppu) {
                     ppu->reg_status |= 0x20;
                     ppu->ovf_set_cycle = 0;
                 }
+#if PPU_FAST_SPECIAL
+                /* render_scanline (cycle 256) spr0_hit_cycle kurmus olabilir: orijinal govdenin sonundaki kontrol. */
+                if (ppu->spr0_hit_cycle && ppu->cycle == ppu->spr0_hit_cycle &&
+                    ppu->scanline < 240) {
+                    ppu->reg_status |= 0x40;
+                    ppu->spr0_hit_cycle = 0;
+                }
+#endif
                 return;
             }
         }

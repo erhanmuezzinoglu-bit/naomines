@@ -2,6 +2,7 @@
 #include "fake6502.h"
 #include <stdbool.h>
 #include <stdint.h>
+#include "cpu_fast.h"
 
 extern int g_nmi_ready;
 extern int g_irq_pending;
@@ -68,6 +69,32 @@ static uint8_t fake6502_unstable_store_timing_read(
 
     return value;
 }
+
+
+/* Opcode basina bayraklar (fake6502_opcodes tablosundan uretildi; FAKE6502_SELFTEST ile dogrulanir):
+ * bit0: addr_mode == acc, bit1: addr_mode == rel, bit2: clockticks == 2. */
+static const uint8_t fake6502_opflags[256] = {
+    0,0,4,0,0,0,0,0,0,4,5,4,0,0,0,0,
+    6,0,4,0,0,0,0,0,4,0,4,0,0,0,0,0,
+    0,0,4,0,0,0,0,0,0,4,5,4,0,0,0,0,
+    6,0,4,0,0,0,0,0,4,0,4,0,0,0,0,0,
+    0,0,4,0,0,0,0,0,0,4,5,4,0,0,0,0,
+    6,0,4,0,0,0,0,0,4,0,4,0,0,0,0,0,
+    0,0,4,0,0,0,0,0,0,4,5,4,0,0,0,0,
+    6,0,4,0,0,0,0,0,4,0,4,0,0,0,0,0,
+    4,0,4,0,0,0,0,0,4,4,4,4,0,0,0,0,
+    6,0,4,0,0,0,0,0,4,0,4,0,0,0,0,0,
+    4,0,4,0,0,0,0,0,4,4,4,4,0,0,0,0,
+    6,0,4,0,0,0,0,0,4,0,4,0,0,0,0,0,
+    4,0,4,0,0,0,0,0,4,4,4,4,0,0,0,0,
+    6,0,4,0,0,0,0,0,4,0,4,0,0,0,0,0,
+    4,0,4,0,0,0,0,0,4,4,4,4,0,0,0,0,
+    6,0,4,0,0,0,0,0,4,0,4,0,0,0,0,0,
+};
+
+#define OPF_ACC  1u
+#define OPF_REL  2u
+#define OPF_TWO  4u
 
 // -------------------------------------------------------------------
 // Adresleme Modları
@@ -343,7 +370,7 @@ FAKE6502_FN_ADDR_MODE(indy_p) {
 static uint8_t s_rmw_val = 0;
 
 uint16_t fake6502_get_value(fake6502_context *c) {
-    if (fake6502_opcodes[c->emu.opcode].addr_mode == acc)
+    if (fake6502_opflags[c->emu.opcode] & OPF_ACC)
         return((uint16_t)c->cpu.a);
 
     uint8_t v =
@@ -361,7 +388,7 @@ void fake6502_put_value(
     fake6502_context *c,
     uint16_t saveval
 ) {
-    if (fake6502_opcodes[c->emu.opcode].addr_mode == acc) {
+    if (fake6502_opflags[c->emu.opcode] & OPF_ACC) {
 
         c->cpu.a =
             (uint8_t)(saveval & 0x00FF);
@@ -2209,7 +2236,7 @@ void fake6502_step(fake6502_context *c)
             new_i;
 
     } else if (
-        fake6502_opcodes[opcode].addr_mode == rel
+        fake6502_opflags[opcode] & OPF_REL
     ) {
 
         if (!c->emu.branch_taken) {
@@ -2232,7 +2259,7 @@ void fake6502_step(fake6502_context *c)
         }
 
     } else if (
-        fake6502_opcodes[opcode].clockticks == 2
+        fake6502_opflags[opcode] & OPF_TWO
     ) {
 
         irq_signal =
@@ -2246,3 +2273,18 @@ void fake6502_step(fake6502_context *c)
 
     c->emu.instructions++;
 }
+
+#ifdef FAKE6502_SELFTEST
+/* Bayrak tablosu opcode tablosuyla tutarli mi? 0 = tamam. */
+int fake6502_selftest_flags(void)
+{
+    for (int i = 0; i < 256; i++) {
+        unsigned want = 0;
+        if (fake6502_opcodes[i].addr_mode == acc) want |= OPF_ACC;
+        if (fake6502_opcodes[i].addr_mode == rel) want |= OPF_REL;
+        if (fake6502_opcodes[i].clockticks == 2)  want |= OPF_TWO;
+        if (want != fake6502_opflags[i]) return i + 1;
+    }
+    return 0;
+}
+#endif

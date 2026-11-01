@@ -72,13 +72,13 @@ static uint8_t fake6502_unstable_store_timing_read(
 
 
 /* Opcode basina bayraklar (fake6502_opcodes tablosundan uretildi; FAKE6502_SELFTEST ile dogrulanir):
- * bit0: addr_mode == acc, bit1: addr_mode == rel, bit2: clockticks == 2. */
+ * bit0: addr_mode == acc, bit1: addr_mode == rel, bit2: clockticks == 2, bit3: opcode $00 veya $40. */
 static const uint8_t fake6502_opflags[256] = {
-    0,0,4,0,0,0,0,0,0,4,5,4,0,0,0,0,
+    8,0,4,0,0,0,0,0,0,4,5,4,0,0,0,0,
     6,0,4,0,0,0,0,0,4,0,4,0,0,0,0,0,
     0,0,4,0,0,0,0,0,0,4,5,4,0,0,0,0,
     6,0,4,0,0,0,0,0,4,0,4,0,0,0,0,0,
-    0,0,4,0,0,0,0,0,0,4,5,4,0,0,0,0,
+    8,0,4,0,0,0,0,0,0,4,5,4,0,0,0,0,
     6,0,4,0,0,0,0,0,4,0,4,0,0,0,0,0,
     0,0,4,0,0,0,0,0,0,4,5,4,0,0,0,0,
     6,0,4,0,0,0,0,0,4,0,4,0,0,0,0,0,
@@ -95,6 +95,7 @@ static const uint8_t fake6502_opflags[256] = {
 #define OPF_ACC  1u
 #define OPF_REL  2u
 #define OPF_TWO  4u
+#define OPF_RTBK 8u   /* RTI ($40) veya BRK ($00) */
 
 // -------------------------------------------------------------------
 // Adresleme Modları
@@ -2172,45 +2173,49 @@ void fake6502_step(fake6502_context *c)
 {
     s_unstable_store_dma_halt = 0;
 
-    uint8_t old_i =
+    const uint8_t old_i =
         c->cpu.flags &
         FAKE6502_INTERRUPT_FLAG;
-
-    c->emu.branch_taken = 0;
-    c->emu.branch_page_crossed = 0;
-    c->emu.branch_irq_first_poll = 0;
-    c->emu.branch_irq_second_poll = 0;
 
     c->emu.instruction_pc =
         c->cpu.pc;
 
-    uint8_t opcode =
+    const uint8_t opcode =
         fake6502_mem_read(
             c,
             c->cpu.pc++
         );
 
-    int irq_after_opcode_fetch =
+    const int irq_after_opcode_fetch =
         g_irq_pending;
 
-    c->emu.branch_irq_first_poll =
-        irq_after_opcode_fetch ? 1 : 0;
+    const unsigned fl =
+        fake6502_opflags[opcode];
+
+    /* Dal alanlari yalniz rel (dallanma) komutlarinda okunur ve bra tarafindan guncellenir:
+     * digerlerinde sifirlamak/atamak gereksiz. */
+    if (fl & OPF_REL) {
+        c->emu.branch_taken = 0;
+        c->emu.branch_page_crossed = 0;
+        c->emu.branch_irq_first_poll =
+            irq_after_opcode_fetch ? 1 : 0;
+        c->emu.branch_irq_second_poll = 0;
+    }
 
     c->emu.opcode =
         opcode;
 
-    fake6502_opcodes[opcode].addr_mode(c);
-    fake6502_opcodes[opcode].opcode(c);
-
-    uint8_t new_i =
-        c->cpu.flags &
-        FAKE6502_INTERRUPT_FLAG;
-
-    uint8_t poll_i =
-        old_i;
+    {
+        const fake6502_opcode *const op = &fake6502_opcodes[opcode];
+        op->addr_mode(c);
+        op->opcode(c);
+    }
 
     int irq_signal =
         g_irq_poll_snapshot;
+
+    uint8_t poll_i =
+        old_i;
 
     /*
      * NMI polling: fake6502_step, komut bittikten sonra g_nmi_pending
@@ -2218,52 +2223,49 @@ void fake6502_step(fake6502_context *c)
      * sonraki komut başında görüp NMI'yi servis eder. Bu blok, NMI
      * mekanizmasının tek tetikleyicisidir — kaldırılırsa NMI hiç ateşlenmez.
      */
-    if (opcode != 0x00 && g_nmi_pending) {
+    if (g_nmi_pending && opcode != 0x00) {
         g_nmi_ready = 1;
     }
 
-    if (opcode == 0x40) {
+    if (fl & (OPF_RTBK | OPF_REL | OPF_TWO)) {
 
-        poll_i =
-            new_i;
+        if (fl & OPF_RTBK) {
 
-        irq_signal =
-            g_irq_pending;
+            poll_i =
+                c->cpu.flags &
+                FAKE6502_INTERRUPT_FLAG;
 
-    } else if (opcode == 0x00) {
+            if (opcode == 0x40) {
+                irq_signal =
+                    g_irq_pending;
+            }
 
-        poll_i =
-            new_i;
+        } else if (fl & OPF_REL) {
 
-    } else if (
-        fake6502_opflags[opcode] & OPF_REL
-    ) {
+            if (!c->emu.branch_taken) {
 
-        if (!c->emu.branch_taken) {
+                irq_signal =
+                    c->emu.branch_irq_first_poll;
 
-            irq_signal =
-                c->emu.branch_irq_first_poll;
+            } else if (
+                c->emu.branch_page_crossed
+            ) {
 
-        } else if (
-            c->emu.branch_page_crossed
-        ) {
+                irq_signal =
+                    c->emu.branch_irq_first_poll ||
+                    c->emu.branch_irq_second_poll;
 
-            irq_signal =
-                c->emu.branch_irq_first_poll ||
-                c->emu.branch_irq_second_poll;
+            } else {
+
+                irq_signal =
+                    c->emu.branch_irq_first_poll;
+            }
 
         } else {
 
             irq_signal =
-                c->emu.branch_irq_first_poll;
+                irq_after_opcode_fetch;
         }
-
-    } else if (
-        fake6502_opflags[opcode] & OPF_TWO
-    ) {
-
-        irq_signal =
-            irq_after_opcode_fetch;
     }
 
     c->emu.pending_irq =
@@ -2283,6 +2285,7 @@ int fake6502_selftest_flags(void)
         if (fake6502_opcodes[i].addr_mode == acc) want |= OPF_ACC;
         if (fake6502_opcodes[i].addr_mode == rel) want |= OPF_REL;
         if (fake6502_opcodes[i].clockticks == 2)  want |= OPF_TWO;
+        if (i == 0x00 || i == 0x40)               want |= OPF_RTBK;
         if (want != fake6502_opflags[i]) return i + 1;
     }
     return 0;

@@ -22,6 +22,12 @@
 #define PPU_FAST_SPECIAL 1
 #endif
 
+/* 1: render_bg_line_fast, desen bit duzlemlerini tablo ile 4-bit alanlara acar ve karo basina 4 girdilik palet
+ * tablosu kullanir (c==0 kosulu ve piksel basina bit ayiklama yok). 0: eski piksel dongusu. Referans. */
+#ifndef PPU_FAST_BG_LUT
+#define PPU_FAST_BG_LUT 1
+#endif
+
 #if EXP_ABLATE
 /* SADECE OLCUM: gercek oyunda PPU adimlamanin cagri/dot istatistigi (tam sayim, zamanlama yok). */
 unsigned long g_ps_calls, g_ps_dots, g_ps_c3, g_ps_small, g_ps_slow, g_ps_bulk_calls, g_ps_bulk_dots;
@@ -1142,6 +1148,85 @@ static void sps_end_of_fast_line(ppu_t *ppu)
  *  Farklar (sonuc ayni): yansitma tablosu (ppu_core_vram_mask switch'i yerine), yerel palet
  *  tablosu, kenar disi karolarda sinir kontrolsuz 8 piksel, bg_pixels istege bagli (NULL olabilir).
  * ============================================================ */
+#if PPU_FAST_BG_LUT
+/* spread[b]: b'nin bit (7-k)'si, 4*k. bitine tasinir (piksel k = soldan k. piksel). */
+static uint32_t s_spread[256];
+static void bg_spread_init(void)
+{
+    for (unsigned b = 0; b < 256; b++) {
+        uint32_t w = 0;
+        for (unsigned k = 0; k < 8; k++) w |= (uint32_t)((b >> (7 - k)) & 1u) << (4 * k);
+        s_spread[b] = w;
+    }
+}
+
+static inline __attribute__((always_inline))
+void bg_line_fast_impl(ppu_t *ppu, uint8_t *restrict bg_pixels, const int has_bg)
+{
+    scr_pixel_t *restrict dst = &screen_buffer[ppu->scanline * 256];
+
+    uint16_t v       = ppu->line_latched ? ppu->line_v : ppu->v;
+    const uint8_t fine_x = ppu->line_latched ? ppu->line_x : ppu->x;
+    const uint16_t bg_base = (ppu->line_latched ? ppu->line_bg_hi : ((ppu->reg_ctrl & 0x10) != 0))
+                             ? 0x1000 : 0x0000;
+
+    scr_pixel_t pal16[16];
+    for (int i = 0; i < 16; i++)
+        pal16[i] = nes_color_to_1555(ppu->palette_ram[(i & 3) ? i : 0]);
+
+    uint16_t nt_base[4];
+    for (int i = 0; i < 4; i++)
+        nt_base[i] = (uint16_t)(ppu_core_vram_mask((uint16_t)(0x2000 + (i << 10)), ppu->mirroring) & 0x0C00);
+
+    const uint8_t *restrict vram = ppu->vram;
+
+    for (int tile = 0; tile < 33; tile++) {
+        const uint16_t nt_addr = 0x2000 | (v & 0x0FFF);
+        const uint8_t tile_idx = vram[0x2000 | nt_base[(nt_addr >> 10) & 3] | (nt_addr & 0x03FF)];
+
+        const uint16_t fine_y = (v >> 12) & 0x07;
+        const uint16_t p_addr = (uint16_t)(bg_base + tile_idx * 16 + fine_y);
+
+        const uint16_t at_addr = 0x23C0 | (v & 0x0C00) | ((v >> 4) & 0x38) | ((v >> 2) & 0x07);
+        const uint8_t attr = vram[0x2000 | nt_base[(at_addr >> 10) & 3] | (at_addr & 0x03FF)];
+        const unsigned hi4 = (unsigned)((attr >> (((v >> 4) & 4) | (v & 2))) & 0x03) << 2;
+
+        const unsigned p0 = vram[p_addr];
+        const unsigned p1 = vram[(uint16_t)(p_addr + 8)];
+        const uint32_t w = s_spread[p0] | (s_spread[p1] << 1);
+
+        /* c==0 -> pal16[0]; c!=0 -> pal16[hi4|c] */
+        const scr_pixel_t pal4[4] = { pal16[0], pal16[hi4 | 1], pal16[hi4 | 2], pal16[hi4 | 3] };
+
+        const int px0 = tile * 8 - (int)fine_x;
+        if (tile != 0 && tile != 32) {
+            scr_pixel_t *restrict d = dst + px0;
+#define BGPX(K) do { \
+                const unsigned c = (unsigned)(w >> (4 * (K))) & 3u; \
+                d[(K)] = pal4[c]; \
+                if (has_bg) bg_pixels[px0 + (K)] = (uint8_t)c; \
+            } while (0)
+            BGPX(0); BGPX(1); BGPX(2); BGPX(3); BGPX(4); BGPX(5); BGPX(6); BGPX(7);
+#undef BGPX
+        } else {
+            for (int dot = 0; dot < 8; dot++) {
+                const int px = px0 + dot;
+                if (px < 0 || px >= 256) continue;
+                const unsigned c = (unsigned)(w >> (4 * dot)) & 3u;
+                dst[px] = pal4[c];
+                if (has_bg) bg_pixels[px] = (uint8_t)c;
+            }
+        }
+        v_inc_coarse_x(&v);
+    }
+}
+
+static void render_bg_line_fast(ppu_t *ppu, uint8_t *restrict bg_pixels)
+{
+    if (bg_pixels) bg_line_fast_impl(ppu, bg_pixels, 1);
+    else           bg_line_fast_impl(ppu, NULL, 0);
+}
+#else
 static void render_bg_line_fast(ppu_t *ppu, uint8_t *restrict bg_pixels)
 {
     scr_pixel_t *restrict dst = &screen_buffer[ppu->scanline * 256];
@@ -1200,6 +1285,8 @@ static void render_bg_line_fast(ppu_t *ppu, uint8_t *restrict bg_pixels)
         v_inc_coarse_x(&v);
     }
 }
+
+#endif
 
 /* ============================================================
  *  Satır çizimi (dot 256'da)
@@ -1289,6 +1376,9 @@ void ppu_init(ppu_t *ppu) {
         ppu->palette_ram[i] = nintendo_power_up_palette[i];
     }
 #if EXP_FAST_BLIT
+#if PPU_FAST_BG_LUT
+    bg_spread_init();
+#endif
     ppu_blit_init();
 #endif
 }

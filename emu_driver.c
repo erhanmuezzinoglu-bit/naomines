@@ -711,6 +711,10 @@ uint32_t emu_driver_step_1(void)
         g_cpu->emu.pending_irq = 0;
 
         fake6502_nmi(g_cpu);
+#if EXP_LAZY_PPU
+        /* NMI girisi bus cycle'lariyla ilerledi; deadline'a ulasildiysa burada senkronla. */
+        ppu_sync_if_due();
+#endif
     }
 
 #if !EXP_LAZY_APU
@@ -725,9 +729,7 @@ uint32_t emu_driver_step_1(void)
     }
 #endif
 
-#if EXP_LAZY_PPU
-    ppu_sync_if_due();
-#else
+#if !EXP_LAZY_PPU
     emu_driver_sync_ppu();
 #endif
     return cpu_cycles;

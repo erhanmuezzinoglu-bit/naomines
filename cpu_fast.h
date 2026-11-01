@@ -26,10 +26,14 @@ extern int g_irq_poll_snapshot;
 extern int g_dl_min;
 
 #if EXP_ABLATE
-/* SADECE OLCUM: M6/M7 eski yavas yollari kullanir (bypass modlari). */
-#define CPU_FAST_ABLATE_OK() (g_exp_mode < 6)
+/* SADECE OLCUM. M7 (surucu sarmalayicisi yok) ve M6 (bus alan atamalari yok) asagida satir ici
+ * taklit edilir; boylece M0-M5 ve M8/M9 hizli yolu, M6/M7 ise yalnizca kendi atladiklari isi kaldirilmis
+ * halini olcer (eskiden mod >= 6 yavas yola dusuyordu: M6-M9 satirlari sisiyordu). */
+#define CPU_FAST_ABLATE_M7() (g_exp_mode == 7)
+#define CPU_FAST_ABLATE_M6() (g_exp_mode == 6)
 #else
-#define CPU_FAST_ABLATE_OK() 1
+#define CPU_FAST_ABLATE_M7() 0
+#define CPU_FAST_ABLATE_M6() 0
 #endif
 
 #ifdef CPU_FAST_HOOK
@@ -45,20 +49,35 @@ static inline uint8_t cpu_read_fast(fake6502_context *c, uint16_t address)
     nes_bus_t *bus = (nes_bus_t *)c->state_host;
     const int now = c->emu.clockticks + 1;
 
+#if EXP_ABLATE
+    if (CPU_FAST_ABLATE_M7() && bus != 0 && (address < 0x2000u || address >= 0x8000u)) {
+        c->emu.clockticks = now;
+        bus->last_ppu_sync_tick = (uint32_t)now;
+        bus->last_apu_sync_tick = (uint32_t)now;
+        {
+            const uint8_t v7 = (address < 0x2000u) ? bus->mem[address & 0x07FFu] : bus->mem[address];
+            CPU_FAST_TRACE(c, address, v7, 1);
+            return v7;
+        }
+    }
+#endif
+
     if (__builtin_expect(
             bus != 0 &&
-            (address < 0x2000u || address >= 0x8000u) &&
+            (uint16_t)(address - 0x2000u) >= 0x6000u &&   /* RAM ($0000-$1FFF) veya PRG ($8000-$FFFF) */
             bus->apu.dmc.dma_request == 0 &&
             (int32_t)((uint32_t)now - (uint32_t)g_dl_min) < 0 &&
-            CPU_FAST_ABLATE_OK(), 1)) {
+            !CPU_FAST_ABLATE_M7(), 1)) {
 
         const uint8_t v = (address < 0x2000u) ? bus->mem[address & 0x07FFu] : bus->mem[address];
 
         c->emu.clockticks = now;
-        bus->last_cpu_read_addr = address;
-        if (bus->in) bus->in->pad1_last_bus_was_4016 = 0;
-        bus->open_bus_value = v;
-        bus->cpu_internal_bus_value = v;
+        if (!CPU_FAST_ABLATE_M6()) {
+            bus->last_cpu_read_addr = address;
+            if (bus->in) bus->in->pad1_last_bus_was_4016 = 0;
+            bus->open_bus_value = v;
+            bus->cpu_internal_bus_value = v;
+        }
         g_irq_poll_snapshot = g_irq_pending;
         CPU_FAST_TRACE(c, address, v, 1);
         return v;
@@ -72,17 +91,30 @@ static inline void cpu_write_fast(fake6502_context *c, uint16_t address, uint8_t
     nes_bus_t *bus = (nes_bus_t *)c->state_host;
     const int now = c->emu.clockticks + 1;
 
+#if EXP_ABLATE
+    if (CPU_FAST_ABLATE_M7() && bus != 0 && address < 0x2000u) {
+        c->emu.clockticks = now;
+        bus->last_ppu_sync_tick = (uint32_t)now;
+        bus->last_apu_sync_tick = (uint32_t)now;
+        bus->mem[address & 0x07FFu] = val;
+        CPU_FAST_TRACE(c, address, val, 0);
+        return;
+    }
+#endif
+
     if (__builtin_expect(
             bus != 0 &&
             address < 0x2000u &&
             bus->apu.dmc.dma_request == 0 &&
             (int32_t)((uint32_t)now - (uint32_t)g_dl_min) < 0 &&
-            CPU_FAST_ABLATE_OK(), 1)) {
+            !CPU_FAST_ABLATE_M7(), 1)) {
 
         c->emu.clockticks = now;
-        if (bus->in) bus->in->pad1_last_bus_was_4016 = 0;
-        bus->open_bus_value = val;
-        bus->cpu_internal_bus_value = val;
+        if (!CPU_FAST_ABLATE_M6()) {
+            if (bus->in) bus->in->pad1_last_bus_was_4016 = 0;
+            bus->open_bus_value = val;
+            bus->cpu_internal_bus_value = val;
+        }
         bus->mem[address & 0x07FFu] = val;
         g_irq_poll_snapshot = g_irq_pending;
         CPU_FAST_TRACE(c, address, val, 0);

@@ -135,13 +135,16 @@ static void abl_draw(int y)
 #if EXP_PROFILE
 #define PROF_WIN 8        /* ortalama penceresi (emulasyon dongusu sayisi) */
 
-static uint64_t acc_emu, acc_aud, acc_draw, acc_hud, acc_wait, acc_wall;
-static unsigned long avg_emu, avg_aud, avg_draw, avg_hud, avg_wait;
+static uint64_t acc_emu, acc_aud, acc_draw, acc_hud, acc_wait, acc_wall, acc_in, acc_txt;
+static unsigned long avg_emu, avg_aud, avg_draw, avg_hud, avg_wait, avg_in, avg_txt;
 static unsigned long avg_nes_fps10;      /* NES fps * 10 */
 static int prof_n;
 static int prof_frame0;
 static int prof_have;                    /* en az bir pencere tamamlandi mi */
 #endif
+
+/* Son karede bos dongu atlamasiyla gecilen cycle (HUD: ff:). */
+static unsigned long ff_last_frame;
 
 #if EXP_PROFILE
 static inline int  profile_start_if(void) { return profile_start(); }
@@ -194,14 +197,16 @@ int main(void)
     while (1)
     {
         int p;
-        uint64_t t_emu = 0, t_aud = 0, t_hud = 0, t_draw = 0, t_wait = 0;
+        uint64_t t_emu = 0, t_aud = 0, t_hud = 0, t_draw = 0, t_wait = 0, t_in = 0, t_txt = 0;
 #if EXP_PROFILE
         const int frame_at_start = ppu.frame;
         const int loop_h = profile_start();
         int counted = 0;
 #endif
 
+        p = profile_start_if();
         nes_input_poll(&in);
+        profile_end_into(p, &t_in);
 
         if (!rom_loaded)
         {
@@ -236,6 +241,7 @@ int main(void)
             const int mode_at_start = g_exp_mode;
             unsigned long ps0[PS_N]; PS_SNAP(ps0);
 #endif
+            const unsigned long ff0 = g_ff_cycles_total;
             p = profile_start_if();
             if (in.edge.player1.button6) {
                 for (int i = 0; i < 8; i++) emu_driver_step_1();
@@ -250,17 +256,21 @@ int main(void)
             if (autorun) {
                 for (int f = 0; f < EXP_TURBO_FRAMES; f++) {
                     int cycles_in_frame = 0;
+                    /* Bos dongu atlamasi (EXP_IDLE_FF) kare butcesini asmasin. */
+                    emu_driver_ff_set_stop(cpu.emu.clockticks + steps_per_frame);
                     while (cycles_in_frame < steps_per_frame) {
                         uint32_t dc = emu_driver_step_1();
                         cycles_in_frame += dc;
                         if (dc == 0) break;
                     }
+                    emu_driver_ff_set_stop(0);
 #if EXP_TURBO_FRAMES > 1
                     if (f < EXP_TURBO_FRAMES - 1) discard_audio();
 #endif
                 }
             }
             profile_end_into(p, &t_emu);
+            ff_last_frame = g_ff_cycles_total - ff0;
 #if EXP_ABLATE
             if (autorun && (mode_at_start == 0 || mode_at_start == 4)) {
                 const int mi = (mode_at_start == 0) ? 0 : 1;
@@ -304,7 +314,9 @@ int main(void)
 #endif
         } else {
             p = profile_start_if();
+#if EXP_HUD
             debug_hud_draw(&cpu, autorun, steps_per_frame);
+#endif
             profile_end_into(p, &t_hud);
 
             emu_driver_sync_ppu();   /* tembel PPU: cizimden once guncelle */
@@ -313,21 +325,23 @@ int main(void)
             ppu_draw(&ppu);
             profile_end_into(p, &t_draw);
 
+            p = profile_start_if();
 #if EXP_PROFILE
             /* Olcum satirlari (hud/draw olcumlerinin disinda). */
             video_draw_debug_text(
                 8, 24, rgb(255, 230, 80),
-                "emu:%lu aud:%lu draw:%lu hud:%lu wait:%lu us%s\n"
-                "NES %lu.%lu fps  blit:%d nofill:%d turbo:%d  M%d",
-                avg_emu, avg_aud, avg_draw, avg_hud, avg_wait,
+                "emu:%lu aud:%lu draw:%lu hud:%lu wait:%lu in:%lu txt:%lu us%s\n"
+                "NES %lu.%lu fps  blit:%d nofill:%d turbo:%d  M%d  ff:%lu",
+                avg_emu, avg_aud, avg_draw, avg_hud, avg_wait, avg_in, avg_txt,
                 prof_have ? "" : " (olculuyor)",
                 avg_nes_fps10 / 10, avg_nes_fps10 % 10,
                 ppu_blit_mode(), EXP_NO_FILL, EXP_TURBO_FRAMES,
 #if EXP_ABLATE
-                g_exp_mode
+                g_exp_mode,
 #else
-                0
+                0,
 #endif
+                ff_last_frame
                 );
 #endif
 #if EXP_ABLATE
@@ -348,6 +362,7 @@ int main(void)
                     a_[10], a_[11], a_[12], a_[13], a_[14], a_[15], a_[16]);
             }
 #endif
+            profile_end_into(p, &t_txt);
         }
 
         p = profile_start_if();
@@ -361,7 +376,7 @@ int main(void)
             if (!counted) {
                 /* Menu / duraklatma / ROM yukleme: pencereyi sifirla. */
                 prof_n = 0;
-                acc_emu = acc_aud = acc_draw = acc_hud = acc_wait = acc_wall = 0;
+                acc_emu = acc_aud = acc_draw = acc_hud = acc_wait = acc_wall = acc_in = acc_txt = 0;
 #if EXP_ABLATE
                 g_exp_mode = 0;
                 abl_acc = 0; abl_cnt = 0; abl_skip = 1;
@@ -370,6 +385,7 @@ int main(void)
                 if (prof_n == 0) prof_frame0 = frame_at_start;
                 acc_emu += t_emu; acc_aud += t_aud; acc_draw += t_draw;
                 acc_hud += t_hud; acc_wait += t_wait; acc_wall += loop_us;
+                acc_in += t_in; acc_txt += t_txt;
                 prof_n++;
 
                 if (prof_n >= PROF_WIN) {
@@ -381,13 +397,15 @@ int main(void)
                     avg_draw = (unsigned long)(acc_draw / prof_n);
                     avg_hud  = (unsigned long)(acc_hud  / prof_n);
                     avg_wait = (unsigned long)(acc_wait / prof_n);
+                    avg_in   = (unsigned long)(acc_in   / prof_n);
+                    avg_txt  = (unsigned long)(acc_txt  / prof_n);
                     avg_nes_fps10 = acc_wall
                         ? (unsigned long)(((uint64_t)nes_frames * 10000000ULL) / acc_wall)
                         : 0;
                     prof_have = 1;
 
                     prof_n = 0;
-                    acc_emu = acc_aud = acc_draw = acc_hud = acc_wait = acc_wall = 0;
+                    acc_emu = acc_aud = acc_draw = acc_hud = acc_wait = acc_wall = acc_in = acc_txt = 0;
                 }
 
 #if EXP_ABLATE

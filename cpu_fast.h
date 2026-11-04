@@ -24,6 +24,9 @@
 extern int g_irq_pending;
 extern int g_irq_poll_snapshot;
 extern int g_dl_min;
+#if EXP_IDLE_FF
+extern unsigned g_write_epoch;   /* her RAM yazimi / yavas bus erisimi artirir (bos dongu tespiti) */
+#endif
 
 #if EXP_ABLATE
 /* SADECE OLCUM. M7 (surucu sarmalayicisi yok) ve M6 (bus alan atamalari yok) asagida satir ici
@@ -110,6 +113,9 @@ static inline void cpu_write_fast(fake6502_context *c, uint16_t address, uint8_t
             !CPU_FAST_ABLATE_M7(), 1)) {
 
         c->emu.clockticks = now;
+#if EXP_IDLE_FF
+        g_write_epoch++;
+#endif
         if (!CPU_FAST_ABLATE_M6()) {
             if (bus->in) bus->in->pad1_last_bus_was_4016 = 0;
             bus->open_bus_value = val;

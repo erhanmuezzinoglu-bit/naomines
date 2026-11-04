@@ -28,6 +28,12 @@
 #define PPU_FAST_BG_LUT 1
 #endif
 
+/* 1: sprite hattinda iki bit-exact kisayol: (a) eval RANGE tarama dongusu 4'e hizali adreste dogrudan OAM
+ * isaretcisiyle, (b) 4 baytlik bolumu tamamen 0xFF olan (bos) fetch slotu icin sabit sonuc. 0: eski kod. */
+#ifndef PPU_FAST_SPRITE
+#define PPU_FAST_SPRITE 1
+#endif
+
 #if EXP_ABLATE
 /* SADECE OLCUM: gercek oyunda PPU adimlamanin cagri/dot istatistigi (tam sayim, zamanlama yok). */
 unsigned long g_ps_calls, g_ps_dots, g_ps_c3, g_ps_small, g_ps_slow, g_ps_bulk_calls, g_ps_bulk_dots;
@@ -499,6 +505,22 @@ static void sprite_fetch_dot(ppu_t *ppu, int sl, int c)
 static inline void sprite_fetch_slot_full(ppu_t *ppu, int sl, int slot)
 {
     uint8_t a = ppu->oam2_addr, fz = ppu->oam2_frozen;
+#if PPU_FAST_SPRITE
+    /* Bos slot: donmamis, 4'e hizali, tum 4 baytlik ikincil OAM bolumu 0xFF => dongunun sonucu sabit:
+     * fetch_byte = FF*4, oam_buffer = FF, oam2_addr 4 artar (32'ye ulasirsa 0 ve donmus). */
+    if (!fz && (a & 3u) == 0 && a <= 28u) {
+        uint32_t w;
+        memcpy(&w, &ppu->sec_oam[a], 4);
+        if (w == 0xFFFFFFFFu) {
+            uint8_t na = (uint8_t)(a + 4u), nfz = 0;
+            if (na >= 32u) { na = 0; nfz = 1; }
+            ppu->oam2_addr = na; ppu->oam2_frozen = nfz; ppu->oam_buffer = 0xFF;
+            ppu->fetch_byte[0] = ppu->fetch_byte[1] = ppu->fetch_byte[2] = ppu->fetch_byte[3] = 0xFF;
+            sprite_load_slot(ppu, sl, slot);
+            return;
+        }
+    }
+#endif
     uint8_t fb[4] = { ppu->fetch_byte[0], ppu->fetch_byte[1], ppu->fetch_byte[2], ppu->fetch_byte[3] };
     uint8_t buf = ppu->oam_buffer;
 
@@ -1982,6 +2004,27 @@ static inline __attribute__((always_inline)) uint32_t ppu_sprite_bulk(ppu_t *ppu
             if (phase == EVAL_RANGE) {
                 uint32_t q = 0;
                 uint8_t lastY = 0;
+#if PPU_FAST_SPRITE
+                if ((addr & 3u) == 0) {
+                    /* Hizali adres: okunan her bayt bir Y (maske yok), adres 4'er artar, 256'ya ulasinca
+                     * DONE + addr 0. Yukaridaki genel donguyle ayni sonuc. */
+                    const uint8_t *const op = &ppu->oam[addr];
+                    uint32_t lim = pairs_max - p;
+                    const uint32_t avail = (uint32_t)(256u - addr) >> 2;
+                    if (lim > avail) lim = avail;
+                    while (q < lim) {
+                        const uint8_t y2 = op[4u * q];
+                        if ((unsigned)(sl - (int)y2) < (unsigned)height) break;
+                        lastY = y2;
+                        q++;
+                    }
+                    if (q) {
+                        const unsigned na = (unsigned)addr + 4u * q;
+                        if (na > 0xFFu) { phase = EVAL_DONE; addr = (uint8_t)((na & 0xFFu) & 0xFCu); }
+                        else            { addr = (uint8_t)na; }
+                    }
+                } else
+#endif
                 while (p + q < pairs_max) {
                     const uint8_t y2 = oam_read_masked(ppu, addr);
                     if (spr_in_range(sl, y2, height)) break;

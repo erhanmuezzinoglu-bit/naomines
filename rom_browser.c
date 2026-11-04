@@ -298,8 +298,6 @@ static void draw_footer(void)
     float h_dpad_a_b = 18.0f;
     float h_select_start = 42.0f;
 
-    /* Sadece yazı rengini kırmızıya (rgb(255, 0, 0)) çevirdik. */
-
     // 1. D-Pad (Navigate)
     if (btn_dpad_tex) {
         float s = h_dpad_a_b / (float)btn_dpad_png_height;
@@ -384,7 +382,8 @@ void rom_browser_draw(int selected)
 
     if (g_rom_count > 0) {
         int center_x = 320;
-        int center_y = 216;
+        /* ALT HİZALAMA NOKTASI: Tüm kapakların alt kenarı bu Y koordinatına oturacak */
+        int bottom_y = 312; 
         int side_offset = 220; 
 
         for (int i = -3; i <= 3; i++) {
@@ -402,23 +401,33 @@ void rom_browser_draw(int selected)
 
             if (fabsf(current_x - center_x) > side_offset * 2.5f) continue;
 
+            /* Kapak ve çerçevenin boyutlarını hesapla */
             int dw = (int)(cover_mario_png_width * current_scale);
             int dh = (int)(cover_mario_png_height * current_scale);
+            
+            /* Kapağı alt hizala */
+            int cover_x = current_x - (dw / 2);
+            int cover_y = bottom_y - dh;
+            
+            sprite_draw_scaled(cover_x, cover_y, current_scale, current_scale, tex);
 
-            sprite_draw_scaled(current_x - (dw / 2), center_y - (dh / 2), current_scale, current_scale, tex);
+            /* Çerçeveleri kapağın merkezine göre hizala (böylece kapak çerçevenin içinde tam ortada durur) */
+            int cover_center_y = bottom_y - (dh / 2);
 
             if (fabsf(current_x - center_x) < side_offset * 0.5f) {
                 if (frame_blue_tex) {
                     int fw = (int)(frame_blue_png_width * current_scale);
                     int fh = (int)(frame_blue_png_height * current_scale);
-                    sprite_draw_scaled(current_x - (fw / 2), center_y - (fh / 2), current_scale, current_scale, frame_blue_tex);
+                    int frame_y = cover_center_y - (fh / 2);
+                    sprite_draw_scaled(current_x - (fw / 2), frame_y, current_scale, current_scale, frame_blue_tex);
                 }
             } else {
                 if (frame_side_tex) {
                     float s_scale = 1.0f; 
                     int fw = (int)(frame_side_png_width * s_scale);
                     int fh = (int)(frame_side_png_height * s_scale);
-                    sprite_draw_scaled(current_x - (fw / 2), center_y - (fh / 2), s_scale, s_scale, frame_side_tex);
+                    int frame_y = cover_center_y - (fh / 2);
+                    sprite_draw_scaled(current_x - (fw / 2), frame_y, s_scale, s_scale, frame_side_tex);
                 }
             }
         }

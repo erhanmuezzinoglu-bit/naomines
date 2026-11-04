@@ -6,6 +6,11 @@
  * Her anahtar 0 yapildiginda ilgili kod ORIJINAL davranisa doner.
  */
 
+/* 1: debug_hud_draw() (PC/OP/CPU satiri) cizilir. 0: cizilmez (surum derlemesi: EXP_PROFILE=0 EXP_BENCH=0 EXP_HUD=0). */
+#ifndef EXP_HUD
+#define EXP_HUD 1
+#endif
+
 /* Zamanlama olcumu + HUD'a olcum satirlari. */
 #ifndef EXP_PROFILE
 #define EXP_PROFILE 1
@@ -45,6 +50,17 @@
  *    tasarlandi; AccuracyCoin/blargg ile dogrula). 0: eski cycle-basi senkron. */
 #ifndef EXP_LAZY_APU
 #define EXP_LAZY_APU 1
+#endif
+
+/* 1: "Bos dongu atlama" (idle-loop fast-forward, BIT-EXACT tasarlandi). CPU ayni yazmac durumuna
+ *    donen, YALNIZ RAM/PRG okuyan, hicbir yazma/yavas bus erisimi yapmayan bir dongu (ornek:
+ *    "LDA $10 / BEQ geri", "JMP kendisi") iki ardisik turda ayni durumda yakalanirsa, bir sonraki
+ *    gorunur olaya (PPU/APU deadline'i) ve kare butcesine kadar olan tum turlar tek hamlede atlanir:
+ *    clockticks ve komut sayaci ilerler, yazmaclar/bellek zaten ayni kalir. Gerektirir: EXP_LAZY_PPU=1
+ *    ve EXP_LAZY_APU=1; EXP_ABLATE'de M5-M7 modlarinda kapali (olcum referansi). main.c her karede
+ *    emu_driver_ff_set_stop() ile kare sinirini bildirmezse atlama yapilmaz. */
+#ifndef EXP_IDLE_FF
+#define EXP_IDLE_FF 1
 #endif
 
 /* SADECE OLCUM: emulasyon icinde zamanin nereye gittigini bulmak icin bilesenleri

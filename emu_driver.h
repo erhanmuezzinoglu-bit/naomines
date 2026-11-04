@@ -23,6 +23,12 @@ void emu_driver_sync_apu(void);
 /* DMA'da calinan cycle sonrasi: deadline'i gelen tembel PPU/APU olaylarini isle. */
 void emu_driver_dma_cycle_events(void);
 
+/* Bos dongu atlamasinin mutlak clockticks siniri (kare butcesi). 0 = atlama kapali. main.c her karede
+ * emu_driver_ff_set_stop(cpu.emu.clockticks + steps_per_frame) cagirmalidir. */
+void emu_driver_ff_set_stop(int abs_ticks);
+extern unsigned long g_ff_cycles_total;   /* atlanan toplam cycle (istatistik) */
+extern unsigned long g_ff_events_total;   /* atlama sayisi */
+
 void emu_driver_init(fake6502_context *cpu,
                      ppu_t *ppu,
                      nes_input_t *in,

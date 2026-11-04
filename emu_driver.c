@@ -5,6 +5,7 @@
 #include "ppu.h"
 #include "exp_config.h"
 #include <string.h>
+#include <stddef.h>
 
 extern int mapper_irq_pending(void);
 
@@ -147,6 +148,28 @@ int g_ppu_deadline = 0;
 #if EXP_LAZY_APU
 int g_apu_deadline = 0;
 #endif
+#if EXP_IDLE_FF && EXP_LAZY_PPU && EXP_LAZY_APU
+unsigned g_write_epoch = 0;          /* cpu_fast.h ile paylasilir */
+static int g_ff_stop = 0;            /* mutlak clockticks siniri; 0 = atlama kapali */
+unsigned long g_ff_cycles_total = 0; /* istatistik (HUD/test) */
+unsigned long g_ff_events_total = 0;
+void emu_driver_ff_set_stop(int abs_ticks) { g_ff_stop = abs_ticks; }
+static struct {
+    int valid;
+    uint32_t w0;          /* a | x<<8 | y<<16 | flags<<24 (fake6502_cpu_state ilk 4 bayti) */
+    uint8_t s;
+    uint16_t pc;
+    unsigned epoch;
+    int ticks;
+    int instrs;
+} g_ff_lp;
+#define FF_ACTIVE 1
+#else
+void emu_driver_ff_set_stop(int abs_ticks) { (void)abs_ticks; }
+unsigned long g_ff_cycles_total = 0;
+unsigned long g_ff_events_total = 0;
+#define FF_ACTIVE 0
+#endif
 #if EXP_LAZY_PPU && EXP_LAZY_APU
 int g_dl_min = 0;
 #define DL_REFRESH() (g_dl_min = ((int32_t)((uint32_t)g_ppu_deadline - (uint32_t)g_apu_deadline) < 0) ? g_ppu_deadline : g_apu_deadline)
@@ -277,6 +300,9 @@ uint8_t fake6502_mem_read(
     fake6502_context *c,
     uint16_t address)
 {
+#if FF_ACTIVE
+    g_write_epoch++;
+#endif
     nes_bus_t *bus =
         (nes_bus_t *)c->state_host;
 
@@ -409,6 +435,9 @@ void fake6502_mem_write(
     uint16_t address,
     uint8_t val)
 {
+#if FF_ACTIVE
+    g_write_epoch++;
+#endif
     nes_bus_t *bus =
         (nes_bus_t *)c->state_host;
 
@@ -593,6 +622,11 @@ void emu_driver_reset_from_vector(void)
 #if EXP_LAZY_APU
     g_apu_deadline = 0; DL_REFRESH();
 #endif
+#if FF_ACTIVE
+    g_write_epoch++;
+    g_ff_lp.valid = 0;
+    g_ff_stop = 0;
+#endif
     g_cpu_reset_in_progress = 1;
     fake6502_reset(g_cpu);
     g_cpu_reset_in_progress = 0;
@@ -627,6 +661,65 @@ void emu_driver_clear_irq(void)
 /* ============================================================
  * STEP
  * ============================================================ */
+
+#if FF_ACTIVE
+/* ---- Bos dongu atlama (bkz. exp_config.h EXP_IDLE_FF) ----
+ * Gecerlilik: son iki geri-dallanma anindaki CPU durumu (pc,a,x,y,s,flags) AYNI ve aralarinda hicbir
+ * RAM yazimi / yavas bus erisimi (g_write_epoch) olmadiysa tur, bellek ve yazmaclar degismeden tekrar
+ * eder. Tur icindeki her bus cycle'i hizli yoldaydi (deadline gelmedi, DMC istegi yok), yani tur
+ * disariya gorunur hicbir sey yapmadi. Bir sonraki gorunur olay g_dl_min deadline'inda (PPU/APU) olur;
+ * ondan once biten tum turlar atlanabilir. NMI/IRQ bekleyen ya da erteleme durumu varsa atlanmaz. */
+
+_Static_assert(offsetof(fake6502_cpu_state, a) == 0 && offsetof(fake6502_cpu_state, x) == 1 &&
+               offsetof(fake6502_cpu_state, y) == 2 && offsetof(fake6502_cpu_state, flags) == 3,
+               "idle_ff_candidate: a,x,y,flags ardisik 4 bayt olmali");
+
+static inline __attribute__((always_inline)) int idle_ff_candidate(void)
+{
+    fake6502_context *const c = g_cpu;
+    int skipped = 0;
+    uint32_t w0;
+    memcpy(&w0, &c->cpu.a, sizeof w0);   /* a, x, y, flags: yapi basinda ardisik 4 bayt */
+
+    if (g_ff_lp.valid &&
+        g_ff_lp.pc == c->cpu.pc && g_ff_lp.s == c->cpu.s && g_ff_lp.w0 == w0 &&
+        g_ff_lp.epoch == g_write_epoch &&
+        !g_nmi_pending && !g_nmi_ready && !c->emu.pending_irq &&
+        !c->emu.nmi_defer_after_interrupt && !g_cpu_reset_in_progress &&
+        g_bus->apu.dmc.dma_request == 0) {
+
+        const int K = c->emu.clockticks - g_ff_lp.ticks;
+        const int L = c->emu.instructions - g_ff_lp.instrs;
+
+        if (K > 0 && L > 0) {
+            const int now = c->emu.clockticks;
+            /* Atlanan turlarin SON cycle'i da deadline'dan once olmali (hizli yol: now+1 < g_dl_min). */
+            int avail_dl   = (int)((uint32_t)g_dl_min - (uint32_t)now) - 1;
+            int avail_stop = (int)((uint32_t)g_ff_stop - (uint32_t)now);
+            int avail = avail_dl < avail_stop ? avail_dl : avail_stop;
+
+            if (avail >= K) {
+                const int N = avail / K;
+                c->emu.clockticks    += N * K;
+                c->emu.instructions  += N * L;
+                skipped = N * K;
+                g_ff_cycles_total += (unsigned long)skipped;
+                g_ff_events_total++;
+            }
+        }
+    } else {
+        g_ff_lp.valid = 1;
+        g_ff_lp.w0    = w0;
+        g_ff_lp.s     = c->cpu.s;
+        g_ff_lp.pc    = c->cpu.pc;
+        g_ff_lp.epoch = g_write_epoch;
+    }
+
+    g_ff_lp.ticks  = c->emu.clockticks;
+    g_ff_lp.instrs = c->emu.instructions;
+    return skipped;
+}
+#endif
 
 uint32_t emu_driver_step_1(void)
 {
@@ -731,6 +824,16 @@ uint32_t emu_driver_step_1(void)
 
 #if !EXP_LAZY_PPU
     emu_driver_sync_ppu();
+#endif
+#if FF_ACTIVE
+    /* geri (veya ayni adrese) dallanma = dongu adayi */
+    if (g_ff_stop != 0 &&
+#if EXP_ABLATE
+        (g_exp_mode < 5 || g_exp_mode > 7) &&
+#endif
+        g_cpu->cpu.pc <= g_cpu->emu.instruction_pc) {
+        cpu_cycles += idle_ff_candidate();
+    }
 #endif
     return cpu_cycles;
 }

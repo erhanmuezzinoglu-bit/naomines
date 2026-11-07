@@ -34,6 +34,12 @@
 #define PPU_FAST_SPRITE 1
 #endif
 
+/* VARSAYILAN 0 (olcumle geri alindi, asagiya bak). 1: render_bg_line_fast'ta tamamen bos desenli (p0|p1 == 0) karo icin piksel basina bit ayiklama yerine
+ * tek renkle doldurma. Cikti ayni. 0: eski karo dongusu. */
+#ifndef PPU_FAST_BG_BLANK
+#define PPU_FAST_BG_BLANK 0   /* SH-4'te olcuruldu: +0.6 ms yavaslatti (x86 komut sayimi tersini gosteriyordu); kapali */
+#endif
+
 #if EXP_ABLATE
 /* SADECE OLCUM: gercek oyunda PPU adimlamanin cagri/dot istatistigi (tam sayim, zamanlama yok). */
 unsigned long g_ps_calls, g_ps_dots, g_ps_c3, g_ps_small, g_ps_slow, g_ps_bulk_calls, g_ps_bulk_dots;
@@ -1221,6 +1227,18 @@ void bg_line_fast_impl(ppu_t *ppu, uint8_t *restrict bg_pixels, const int has_bg
         const scr_pixel_t pal4[4] = { pal16[0], pal16[hi4 | 1], pal16[hi4 | 2], pal16[hi4 | 3] };
 
         const int px0 = tile * 8 - (int)fine_x;
+#if PPU_FAST_BG_BLANK
+        if ((p0 | p1) == 0 && tile != 0 && tile != 32) {
+            /* Tum pikseller c == 0 -> pal4[0]; bg_pixels = 0. */
+            scr_pixel_t *restrict d = dst + px0;
+            const scr_pixel_t c0 = pal4[0];
+            d[0] = c0; d[1] = c0; d[2] = c0; d[3] = c0; d[4] = c0; d[5] = c0; d[6] = c0; d[7] = c0;
+            if (has_bg) {
+                uint8_t *restrict b = bg_pixels + px0;
+                b[0] = 0; b[1] = 0; b[2] = 0; b[3] = 0; b[4] = 0; b[5] = 0; b[6] = 0; b[7] = 0;
+            }
+        } else
+#endif
         if (tile != 0 && tile != 32) {
             scr_pixel_t *restrict d = dst + px0;
 #define BGPX(K) do { \

@@ -132,7 +132,7 @@ static void abl_draw(int y)
 /* ------------------------------------------------------------------ */
 /* Olcum penceresi: SADECE ROM yukluyken ve autorun aciksken sayilir.  */
 /* ------------------------------------------------------------------ */
-#if EXP_PROFILE
+#if PROF_ACTIVE
 #define PROF_WIN 8        /* ortalama penceresi (emulasyon dongusu sayisi) */
 
 static uint64_t acc_emu, acc_aud, acc_draw, acc_hud, acc_wait, acc_wall, acc_in, acc_txt;
@@ -146,7 +146,7 @@ static int prof_have;                    /* en az bir pencere tamamlandi mi */
 /* Son karede bos dongu atlamasiyla gecilen cycle (HUD: ff:). */
 static unsigned long ff_last_frame;
 
-#if EXP_PROFILE
+#if PROF_ACTIVE
 static inline int  profile_start_if(void) { return profile_start(); }
 static inline void profile_end_into(int h, uint64_t *acc) { *acc += profile_end(h); }
 #else
@@ -198,14 +198,24 @@ int main(void)
     {
         int p;
         uint64_t t_emu = 0, t_aud = 0, t_hud = 0, t_draw = 0, t_wait = 0, t_in = 0, t_txt = 0;
-#if EXP_PROFILE
+#if PROF_ACTIVE
         const int frame_at_start = ppu.frame;
         const int loop_h = profile_start();
         int counted = 0;
 #endif
 
         p = profile_start_if();
+#if EXP_INPUT_PERIOD > 1
+        {
+            /* maple/JVS okumasi ~0.9 ms: her EXP_INPUT_PERIOD karede bir okunur; aradaki karelerde onceki
+             * dugme durumu korunur, kenar (edge) bilgisi sifirlanir. */
+            static unsigned in_frame;
+            if ((in_frame++ % (unsigned)EXP_INPUT_PERIOD) == 0) nes_input_poll(&in);
+            else memset(&in.edge, 0, sizeof(in.edge));
+        }
+#else
         nes_input_poll(&in);
+#endif
         profile_end_into(p, &t_in);
 
         if (!rom_loaded)
@@ -298,7 +308,7 @@ int main(void)
             }
             profile_end_into(p, &t_aud);
 
-#if EXP_PROFILE
+#if PROF_ACTIVE
             counted = autorun;
 #endif
         }
@@ -362,6 +372,10 @@ int main(void)
                     a_[10], a_[11], a_[12], a_[13], a_[14], a_[15], a_[16]);
             }
 #endif
+#if EXP_FPS_HUD && !EXP_PROFILE
+            video_draw_debug_text(8, 24, rgb(255, 230, 80), "NES %lu.%lu fps  ff:%lu",
+                                  avg_nes_fps10 / 10, avg_nes_fps10 % 10, ff_last_frame);
+#endif
             profile_end_into(p, &t_txt);
         }
 
@@ -369,7 +383,7 @@ int main(void)
         video_display_on_vblank();
         profile_end_into(p, &t_wait);
 
-#if EXP_PROFILE
+#if PROF_ACTIVE
         {
             const uint64_t loop_us = profile_end(loop_h);
 

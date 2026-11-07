@@ -6,14 +6,27 @@
  * Her anahtar 0 yapildiginda ilgili kod ORIJINAL davranisa doner.
  */
 
+/* 1: EXP_PROFILE kapaliyken bile tek satir "NES x.x fps" gosterilir (surum derlemesinde fps okumak icin;
+ * maliyeti ~0.03 ms). EXP_PROFILE=1 ise zaten tam olcum satirlari gosterilir. */
+#ifndef EXP_FPS_HUD
+#define EXP_FPS_HUD 1
+#endif
+#define PROF_ACTIVE (EXP_PROFILE || EXP_FPS_HUD)
+
+/* Giris (maple/JVS) okuma sikligi: her EXP_INPUT_PERIOD dongu karesinde bir. 1: her karede (eski davranis).
+ * 2 secilirse okuma maliyeti (~0.9 ms) yarilanir; kisa (<2 kare) tus vuruslari kacabilir. */
+#ifndef EXP_INPUT_PERIOD
+#define EXP_INPUT_PERIOD 2
+#endif
+
 /* 1: debug_hud_draw() (PC/OP/CPU satiri) cizilir. 0: cizilmez (surum derlemesi: EXP_PROFILE=0 EXP_BENCH=0 EXP_HUD=0). */
 #ifndef EXP_HUD
-#define EXP_HUD 1
+#define EXP_HUD 0
 #endif
 
 /* Zamanlama olcumu + HUD'a olcum satirlari. */
 #ifndef EXP_PROFILE
-#define EXP_PROFILE 1
+#define EXP_PROFILE 0
 #endif
 
 /* Dongudeki video_fill_screen() cagrisini kaldir. */
@@ -34,7 +47,7 @@
 
 /* Acilista bir kez CPU/cache kalibrasyon testi (~0.3 sn) kosar, sonucu HUD'a yazar. */
 #ifndef EXP_BENCH
-#define EXP_BENCH 1
+#define EXP_BENCH 0
 #endif
 
 /* 1: PPU her CPU cycle'inda degil, yalniz "disariya gorunur" olaylarda (VBL/NMI, mapper A12

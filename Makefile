@@ -16,41 +16,33 @@ SRCS += mapper.c
 
 # Görseller ve Font (Ana klasörde olmalı)
 SRCS += background.png
+SRCS += logo.png
 SRCS += dejavusans.ttf
-SRCS += frame_blue.png
-SRCS += frame_side.png
 
-# Footer Butonları
-SRCS += btn_b.png
-SRCS += btn_dpad.png
-SRCS += btn_a.png
-SRCS += btn_select.png
-SRCS += btn_start.png
+# Animasyonlu Joystick ve Yeni Buton
+SRCS += joy1.png
+SRCS += joy2.png
+SRCS += joy3.png
+SRCS += btn_main.png
 
-# Eski Kapaklar
+# Kapaklar
 SRCS += cover_mario.png
 SRCS += cover_zelda.png
-SRCS += cover_castlevania.png
-SRCS += cover_punchout.png
 SRCS += cover_smb3.png
-
-# Yeni Kapaklar
-SRCS += cover_streemerz.png
 SRCS += cover_castlevania3.png
-SRCS += cover_crazyclimber.png
-SRCS += cover_crystalmines.png
-SRCS += cover_deadlytowers.png
 SRCS += cover_duckhunt.png
 SRCS += cover_excitebike.png
-SRCS += cover_gargoyle2.png
-SRCS += cover_holydiver.png
+SRCS += cover_gradius.png
+SRCS += cover_castlevania.png
 SRCS += cover_kirby.png
-SRCS += cover_sisyphus.png
-SRCS += cover_marble.png
 SRCS += cover_megaman2.png
 SRCS += cover_metroid.png
 SRCS += cover_prince.png
-SRCS += cover_gradius.png
+SRCS += cover_punchout.png
+SRCS += cover_streemerz.png
+SRCS += cover_crystalmines.png
+SRCS += cover_gargoyle2.png
+SRCS += cover_marble.png
 
 # Temel kurallar ve tool/parametreler
 include ../../Makefile.base

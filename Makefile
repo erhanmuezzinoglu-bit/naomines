@@ -17,7 +17,7 @@ SRCS += mapper.c
 # Görseller ve Font (Ana klasörde olmalı)
 SRCS += background.png
 SRCS += logo.png
-SRCS += dejavusans.ttf
+SRCS += nes_font.ttf
 
 # Animasyonlu Joystick ve Yeni Buton
 SRCS += joy1.png
@@ -43,12 +43,23 @@ SRCS += cover_streemerz.png
 SRCS += cover_crystalmines.png
 SRCS += cover_gargoyle2.png
 SRCS += cover_marble.png
+SRCS += cover_crazyclimber.png
+SRCS += cover_deadlytowers.png
+SRCS += cover_holydiver.png
+SRCS += cover_littlecisyphus.png
+
 
 # Temel kurallar ve tool/parametreler
 include ../../Makefile.base
 
 # Sprite Kütüphanesi
 LIBS += -lnaomisprite
+
+# OGG/Vorbis decoding
+LIBS += -lvorbisfile -lvorbis -logg
+
+# XMP Kütüphanesi (Tracker modülleri / .xm / .mod çalmak için)
+LIBS += -lxmp
 
 # FreeType ve Bağımlılıkları
 ifeq (${FEATURE_FREETYPE}, 1)
@@ -74,7 +85,7 @@ build/romfs.bin: romfs/ ${ROMFSGEN_FILE}
 # Asıl .bin dosyasını üretir.
 naomines.bin: ${MAKEROM_FILE} ${NAOMI_BIN_FILE} build/romfs.bin
 	${MAKEROM} $@ \
-		--title "Naomi NES Explorer" \
+		--title "Naomi NES Emulator" \
 		--publisher "erhanmuezzinoglu" \
 		--serial "${SERIAL}" \
 		--section ${NAOMI_BIN_FILE},${START_ADDR} \

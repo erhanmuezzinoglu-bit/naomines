@@ -6,6 +6,19 @@
 #include <naomi/sprite/sprite.h>
 #include <naomi/ta-freetype.h>
 #include <naomi/font.h>
+#include <naomi/audio.h>
+
+#include <xmp.h>
+
+/*
+ * vorbisfile.h normally defines four convenience callback tables as static
+ * variables in every translation unit. This file uses ov_open()/ov_read(),
+ * not those tables, so exclude them instead of weakening -Werror globally.
+ */
+#ifndef OV_EXCLUDE_STATIC_CALLBACKS
+#define OV_EXCLUDE_STATIC_CALLBACKS
+#endif
+#include <vorbis/vorbisfile.h>
 
 #include <dirent.h>
 #include <string.h>
@@ -13,6 +26,8 @@
 #include <stdint.h>
 #include <math.h>
 #include <limits.h>
+#include <ctype.h>
+#include <stdlib.h>
 
 #define MAX_ROMS          128
 #define ROM_NAME_LEN      64
@@ -31,6 +46,21 @@
 #define BACKGROUND_DRAW_SCALE      2.0f
 #define BACKGROUND_DRAW_X          (-192)
 #define BACKGROUND_DRAW_Y          (-272)
+
+/* Background tracker music and menu selection sound are stored in ROMFS. */
+#define MUSIC_FILE_PATH              "rom://theme.xm"
+#define MENU_SFX_FILE_PATH           "rom://menuhighlight.ogg"
+
+/* The tested menu music setting is 10% faster, with the same 44.1 kHz rate. */
+#define MUSIC_SPEED_PERCENT          110u
+#define MUSIC_DISPLAY_RATE            60u
+
+/* OGG is decoded once at menu startup, then mixed into the tracker PCM. */
+#define MENU_SFX_OUTPUT_RATE         44100u
+#define MENU_SFX_MAX_SECONDS             3u
+#define MENU_SFX_VOICE_COUNT              4u
+#define MENU_SFX_GAIN_Q15             24576  /* 0.75; reduce if effect is too loud. */
+#define MUSIC_MIX_BUFFER_BYTES        32768u
 
 /*
  * Covers are kept at full 512x512 ARGB4444 resolution in a fixed VRAM pool.
@@ -57,6 +87,37 @@ static texture_description_t *joy1_tex = NULL;
 static texture_description_t *joy2_tex = NULL;
 static texture_description_t *joy3_tex = NULL;
 static texture_description_t *btn_main_tex = NULL;
+
+/* Background music player. The audio ringbuffer is owned by main.c. */
+static xmp_context g_xmp_ctx = NULL;
+static int g_music_initialized = 0;
+static int g_music_speed_applied = 0;
+
+/* Decoded menu-highlight OGG, stored as interleaved 44.1 kHz stereo PCM. */
+static int16_t *g_menu_sfx_pcm = NULL;
+static uint32_t g_menu_sfx_frames = 0;
+static uint32_t g_menu_sfx_voice_pos[MENU_SFX_VOICE_COUNT];
+static unsigned int g_menu_sfx_next_voice = 0;
+
+/* A separate copy is needed only while an effect is being mixed. It remains
+ * valid if audio_write_stereo_data() accepts only part of the tracker frame. */
+static int16_t g_music_mix_buffer[MUSIC_MIX_BUFFER_BYTES / sizeof(int16_t)]
+    __attribute__((aligned(32)));
+
+/* Fractional 60 Hz display-frame accumulator for smooth tracker pacing. */
+static uint64_t g_music_fallback_phase = 0;
+static uint32_t g_music_fallback_frame_time = 20000u;
+
+/*
+ * Keep any unqueued part of the current libxmp frame.
+ * audio_write_stereo_data() may accept fewer samples than requested when the
+ * AICA ringbuffer has insufficient free space; the remainder must not be
+ * discarded or the music becomes broken/distorted. The libxmp buffer remains
+ * valid until the next xmp_play_frame(), so do not advance while this is set.
+ */
+static const uint8_t *g_music_pending_buffer = NULL;
+static unsigned int g_music_pending_samples = 0;
+static unsigned int g_music_pending_offset = 0;
 
 typedef struct {
     void *vram;
@@ -180,6 +241,22 @@ extern unsigned int cover_gargoyle2_png_height;
 extern uint8_t *cover_marble_png_data;
 extern unsigned int cover_marble_png_width;
 extern unsigned int cover_marble_png_height;
+
+extern uint8_t *cover_crazyclimber_png_data;
+extern unsigned int cover_crazyclimber_png_width;
+extern unsigned int cover_crazyclimber_png_height;
+
+extern uint8_t *cover_deadlytowers_png_data;
+extern unsigned int cover_deadlytowers_png_width;
+extern unsigned int cover_deadlytowers_png_height;
+
+extern uint8_t *cover_holydiver_png_data;
+extern unsigned int cover_holydiver_png_width;
+extern unsigned int cover_holydiver_png_height;
+
+extern uint8_t *cover_littlecisyphus_png_data;
+extern unsigned int cover_littlecisyphus_png_width;
+extern unsigned int cover_littlecisyphus_png_height;
 
 /* ------------------------------------------------------------------------- */
 /* Small helpers                                                             */
@@ -364,6 +441,32 @@ static void get_cover_data(int index, uint8_t **data,
         *data = cover_marble_png_data;
         *w = cover_marble_png_width;
         *h = cover_marble_png_height;
+    }
+    else if (strstr(name, "Crazy Climber") != NULL ||
+             strstr(name, "CrazyClimber") != NULL) {
+        *data = cover_crazyclimber_png_data;
+        *w = cover_crazyclimber_png_width;
+        *h = cover_crazyclimber_png_height;
+    }
+    else if (strstr(name, "Deadly Towers") != NULL ||
+             strstr(name, "DeadlyTowers") != NULL) {
+        *data = cover_deadlytowers_png_data;
+        *w = cover_deadlytowers_png_width;
+        *h = cover_deadlytowers_png_height;
+    }
+    else if (strstr(name, "Holy Diver") != NULL ||
+             strstr(name, "HolyDiver") != NULL) {
+        *data = cover_holydiver_png_data;
+        *w = cover_holydiver_png_width;
+        *h = cover_holydiver_png_height;
+    }
+    else if (strstr(name, "Little Cisyphus") != NULL ||
+             strstr(name, "LittleCisyphus") != NULL ||
+             strstr(name, "Little Sisyphus") != NULL ||
+             strstr(name, "LittleSisyphus") != NULL) {
+        *data = cover_littlecisyphus_png_data;
+        *w = cover_littlecisyphus_png_width;
+        *h = cover_littlecisyphus_png_height;
     }
     else {
         /* Keep the original default artwork for games without a specific map. */
@@ -826,6 +929,515 @@ static void prepare_cover_cache(int selected)
 }
 
 /* ------------------------------------------------------------------------- */
+/* Background music                                                          */
+/* ------------------------------------------------------------------------- */
+
+/* ------------------------------------------------------------------------- */
+/* OGG menu selection sound                                                  */
+/* ------------------------------------------------------------------------- */
+
+static void release_menu_select_sfx(void)
+{
+    free(g_menu_sfx_pcm);
+    g_menu_sfx_pcm = NULL;
+    g_menu_sfx_frames = 0;
+    memset(g_menu_sfx_voice_pos, 0, sizeof(g_menu_sfx_voice_pos));
+    g_menu_sfx_next_voice = 0;
+}
+
+/*
+ * Decode the short OGG effect at menu startup. libvorbisfile is part of the
+ * libnaomi 3rdparty ports (libvorbisfile -> libvorbis -> libogg). The decoded
+ * data is kept in RAM so selection changes never perform file I/O or Vorbis
+ * decoding in the frame loop.
+ *
+ * Output is normalized to interleaved signed 16-bit stereo at the same 44.1
+ * kHz rate as main.c's existing AICA ringbuffer. Mono source files are copied
+ * to both channels; non-44.1 kHz files are linearly resampled once at startup.
+ */
+static int load_menu_select_sfx(void)
+{
+    FILE *fp = NULL;
+    OggVorbis_File ogg;
+    vorbis_info *info;
+    int ogg_open = 0;
+    int channels;
+    uint32_t source_rate;
+    uint64_t total_frames;
+    uint64_t source_bytes_64;
+    size_t source_bytes;
+    size_t decoded_bytes = 0;
+    size_t bytes_per_frame;
+    int16_t *source_pcm = NULL;
+    int16_t *output_pcm = NULL;
+    uint64_t source_frames;
+    uint64_t output_frames;
+    uint64_t output_bytes_64;
+    int result = 0;
+
+    if (g_menu_sfx_pcm && g_menu_sfx_frames > 0) {
+        return 1;
+    }
+
+    fp = fopen(MENU_SFX_FILE_PATH, "rb");
+    if (!fp) {
+        return 0;
+    }
+
+    if (ov_open(fp, &ogg, NULL, 0) < 0) {
+        /* ov_open() does not take ownership of fp when it fails. */
+        fclose(fp);
+        return 0;
+    }
+    ogg_open = 1;
+
+    info = ov_info(&ogg, -1);
+    if (!info || (info->channels != 1 && info->channels != 2) ||
+        info->rate < 8000 || info->rate > 192000) {
+        goto cleanup;
+    }
+
+    channels = info->channels;
+    source_rate = (uint32_t)info->rate;
+    total_frames = (uint64_t)ov_pcm_total(&ogg, -1);
+
+    /* A menu click should be short. This also bounds memory on malformed files. */
+    if (total_frames == 0 ||
+        total_frames > (uint64_t)source_rate * MENU_SFX_MAX_SECONDS) {
+        goto cleanup;
+    }
+
+    bytes_per_frame = (size_t)channels * sizeof(int16_t);
+    source_bytes_64 = total_frames * (uint64_t)bytes_per_frame;
+    if (source_bytes_64 == 0 || source_bytes_64 > (uint64_t)SIZE_MAX) {
+        goto cleanup;
+    }
+    source_bytes = (size_t)source_bytes_64;
+
+    source_pcm = (int16_t *)malloc(source_bytes);
+    if (!source_pcm) {
+        goto cleanup;
+    }
+
+    while (decoded_bytes < source_bytes) {
+        size_t remaining = source_bytes - decoded_bytes;
+        int request = (remaining > 4096u) ? 4096 : (int)remaining;
+        int bitstream = 0;
+        long got;
+        vorbis_info *current_info;
+
+        request -= request % (int)bytes_per_frame;
+        if (request <= 0) {
+            break;
+        }
+
+        got = ov_read(&ogg,
+                      (char *)source_pcm + decoded_bytes,
+                      request,
+                      0,      /* little endian */
+                      2,      /* 16-bit output */
+                      1,      /* signed output */
+                      &bitstream);
+        if (got == 0) {
+            break;
+        }
+        if (got < 0 || (size_t)got > remaining ||
+            ((size_t)got % bytes_per_frame) != 0) {
+            goto cleanup;
+        }
+
+        /* Reject chained streams whose sample format changes mid-file. */
+        current_info = ov_info(&ogg, bitstream);
+        if (!current_info || current_info->channels != channels ||
+            current_info->rate != (long)source_rate) {
+            goto cleanup;
+        }
+
+        decoded_bytes += (size_t)got;
+    }
+
+    if (decoded_bytes != source_bytes ||
+        (decoded_bytes % bytes_per_frame) != 0) {
+        goto cleanup;
+    }
+
+    source_frames = (uint64_t)(decoded_bytes / bytes_per_frame);
+    output_frames =
+        (source_frames * MENU_SFX_OUTPUT_RATE + (source_rate / 2u)) /
+        source_rate;
+    if (output_frames == 0 ||
+        output_frames > (uint64_t)MENU_SFX_OUTPUT_RATE * MENU_SFX_MAX_SECONDS) {
+        goto cleanup;
+    }
+
+    output_bytes_64 = output_frames * 2u * sizeof(int16_t);
+    if (output_bytes_64 > (uint64_t)SIZE_MAX) {
+        goto cleanup;
+    }
+
+    output_pcm = (int16_t *)malloc((size_t)output_bytes_64);
+    if (!output_pcm) {
+        goto cleanup;
+    }
+
+    /* Linear resampling is done once here, never during carousel navigation. */
+    for (uint64_t out_frame = 0; out_frame < output_frames; out_frame++) {
+        uint64_t source_position = out_frame * source_rate;
+        uint64_t source_index = source_position / MENU_SFX_OUTPUT_RATE;
+        uint32_t fraction = (uint32_t)(source_position % MENU_SFX_OUTPUT_RATE);
+        uint64_t next_index;
+        int32_t left0;
+        int32_t left1;
+        int32_t right0;
+        int32_t right1;
+        int32_t left;
+        int32_t right;
+
+        if (source_index >= source_frames) {
+            source_index = source_frames - 1u;
+        }
+        next_index = (source_index + 1u < source_frames)
+            ? source_index + 1u
+            : source_index;
+
+        if (channels == 1) {
+            left0 = source_pcm[source_index];
+            left1 = source_pcm[next_index];
+            right0 = left0;
+            right1 = left1;
+        } else {
+            left0 = source_pcm[source_index * 2u];
+            left1 = source_pcm[next_index * 2u];
+            right0 = source_pcm[source_index * 2u + 1u];
+            right1 = source_pcm[next_index * 2u + 1u];
+        }
+
+        left = (int32_t)(((int64_t)left0 *
+                         (MENU_SFX_OUTPUT_RATE - fraction) +
+                         (int64_t)left1 * fraction) /
+                        MENU_SFX_OUTPUT_RATE);
+        right = (int32_t)(((int64_t)right0 *
+                          (MENU_SFX_OUTPUT_RATE - fraction) +
+                          (int64_t)right1 * fraction) /
+                         MENU_SFX_OUTPUT_RATE);
+
+        output_pcm[out_frame * 2u] = (int16_t)left;
+        output_pcm[out_frame * 2u + 1u] = (int16_t)right;
+    }
+
+    g_menu_sfx_pcm = output_pcm;
+    g_menu_sfx_frames = (uint32_t)output_frames;
+    output_pcm = NULL;
+    result = 1;
+
+cleanup:
+    free(source_pcm);
+    free(output_pcm);
+    if (ogg_open) {
+        ov_clear(&ogg);
+    }
+    return result;
+}
+
+static void play_menu_select_sfx(void)
+{
+    unsigned int n;
+    unsigned int voice = MENU_SFX_VOICE_COUNT;
+
+    if (!g_menu_sfx_pcm || g_menu_sfx_frames == 0) {
+        return;
+    }
+
+    /* Prefer an idle voice. If all are busy, replace the next voice so fast
+     * repeated button presses can still be heard without allocating memory. */
+    for (n = 0; n < MENU_SFX_VOICE_COUNT; n++) {
+        unsigned int candidate =
+            (g_menu_sfx_next_voice + n) % MENU_SFX_VOICE_COUNT;
+        if (g_menu_sfx_voice_pos[candidate] == 0) {
+            voice = candidate;
+            break;
+        }
+    }
+    if (voice == MENU_SFX_VOICE_COUNT) {
+        voice = g_menu_sfx_next_voice;
+    }
+
+    /* Position is stored as sample-frame index + 1; zero means inactive. */
+    g_menu_sfx_voice_pos[voice] = 1;
+    g_menu_sfx_next_voice = (voice + 1u) % MENU_SFX_VOICE_COUNT;
+}
+
+static int menu_select_sfx_has_active_voice(void)
+{
+    unsigned int i;
+
+    for (i = 0; i < MENU_SFX_VOICE_COUNT; i++) {
+        if (g_menu_sfx_voice_pos[i] != 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int16_t clamp_sfx_mix_sample(int32_t sample)
+{
+    if (sample > 32767) {
+        sample = 32767;
+    } else if (sample < -32768) {
+        sample = -32768;
+    }
+    return (int16_t)sample;
+}
+
+/* Add active OGG voices to one interleaved 16-bit stereo tracker frame. */
+static void mix_menu_select_sfx(int16_t *stereo, unsigned int frame_count)
+{
+    unsigned int frame;
+
+    if (!stereo || !g_menu_sfx_pcm || g_menu_sfx_frames == 0) {
+        return;
+    }
+
+    for (frame = 0; frame < frame_count; frame++) {
+        int32_t left = stereo[frame * 2u];
+        int32_t right = stereo[frame * 2u + 1u];
+        unsigned int voice;
+
+        for (voice = 0; voice < MENU_SFX_VOICE_COUNT; voice++) {
+            uint32_t encoded_position = g_menu_sfx_voice_pos[voice];
+            uint32_t sample_frame;
+
+            if (encoded_position == 0) {
+                continue;
+            }
+
+            sample_frame = encoded_position - 1u;
+            if (sample_frame >= g_menu_sfx_frames) {
+                g_menu_sfx_voice_pos[voice] = 0;
+                continue;
+            }
+
+            left += ((int32_t)g_menu_sfx_pcm[sample_frame * 2u] *
+                     MENU_SFX_GAIN_Q15) >> 15;
+            right += ((int32_t)g_menu_sfx_pcm[sample_frame * 2u + 1u] *
+                      MENU_SFX_GAIN_Q15) >> 15;
+
+            sample_frame++;
+            g_menu_sfx_voice_pos[voice] =
+                (sample_frame < g_menu_sfx_frames) ? sample_frame + 1u : 0;
+        }
+
+        stereo[frame * 2u] = clamp_sfx_mix_sample(left);
+        stereo[frame * 2u + 1u] = clamp_sfx_mix_sample(right);
+    }
+}
+
+static void init_background_music(void)
+{
+    if (g_music_initialized) {
+        return;
+    }
+
+    /*
+     * main.c already calls audio_init() and registers the 44.1 kHz, 16-bit
+     * stereo ringbuffer before rom_browser_init(). Do not initialize audio or
+     * register another ringbuffer here: audio_register_ringbuffer() replaces
+     * the existing one and resets its playback/write positions.
+     */
+    g_xmp_ctx = xmp_create_context();
+    if (!g_xmp_ctx) {
+        return;
+    }
+
+    if (xmp_load_module(g_xmp_ctx, MUSIC_FILE_PATH) < 0) {
+        xmp_free_context(g_xmp_ctx);
+        g_xmp_ctx = NULL;
+        return;
+    }
+
+    /* Decode the OGG once. If it is absent or invalid, keep the music alive. */
+    (void)load_menu_select_sfx();
+
+    /*
+     * Format 0 is libxmp's default signed 16-bit stereo output. This matches
+     * main.c's AUDIO_FORMAT_16BIT / 44100 Hz ringbuffer.
+     */
+    if (xmp_start_player(g_xmp_ctx, 44100, 0) < 0) {
+        release_menu_select_sfx();
+        xmp_release_module(g_xmp_ctx);
+        xmp_free_context(g_xmp_ctx);
+        g_xmp_ctx = NULL;
+        return;
+    }
+
+    /* Cubic interpolation; AMP=1 is libxmp's normal default level. */
+    (void)xmp_set_player(g_xmp_ctx, XMP_PLAYER_INTERP, XMP_INTERP_SPLINE);
+    (void)xmp_set_player(g_xmp_ctx, XMP_PLAYER_AMP, 1);
+
+    /*
+     * Use xmp_set_tempo_factor() for compatibility with the older libxmp
+     * version bundled with the Naomi build. For this XM module the default
+     * base tempo factor is 1.0, so 100/110 shortens tracker ticks to give
+     * 10% faster playback without changing the 44.1 kHz sample rate or pitch.
+     * libxmp does not update fi.frame_time for this setting; the scheduler
+     * below applies the same factor when calculating its frame cadence.
+     */
+    g_music_speed_applied =
+        (xmp_set_tempo_factor(
+            g_xmp_ctx, 100.0 / (double)MUSIC_SPEED_PERCENT) == 0);
+
+    /* Restore full ringbuffer output level; 0.7 was unnecessarily attenuating. */
+    (void)audio_change_ringbuffer_volume(1.0f);
+
+    g_music_pending_buffer = NULL;
+    g_music_pending_samples = 0;
+    g_music_pending_offset = 0;
+    g_music_fallback_phase = 0;
+    g_music_fallback_frame_time = (uint32_t)(
+        (20000ULL * 100ULL + (MUSIC_SPEED_PERCENT / 2u)) /
+        (g_music_speed_applied ? MUSIC_SPEED_PERCENT : 100u));
+    /* Let the first tracker frame be generated immediately on the first draw. */
+    {
+        uint64_t first_threshold =
+            (uint64_t)g_music_fallback_frame_time * MUSIC_DISPLAY_RATE;
+        g_music_fallback_phase = (first_threshold > 1000000ULL)
+            ? (first_threshold - 1000000ULL)
+            : 0;
+    }
+    g_music_initialized = 1;
+}
+
+static void update_background_music(void)
+{
+    struct xmp_frame_info fi;
+    int ret;
+
+    if (!g_music_initialized || !g_xmp_ctx) {
+        return;
+    }
+
+    /* Finish queuing the previous tracker frame before asking libxmp for the
+     * next one. This preserves samples when the AICA ringbuffer is temporarily
+     * short on free space. One sample here means one interleaved L/R pair. */
+    if (g_music_pending_buffer &&
+        g_music_pending_offset < g_music_pending_samples) {
+        unsigned int remaining =
+            g_music_pending_samples - g_music_pending_offset;
+        const void *src = g_music_pending_buffer +
+            ((size_t)g_music_pending_offset * 4u);
+        int written = audio_write_stereo_data((void *)src, remaining);
+
+        if (written < 0) {
+            return;
+        }
+
+        if ((unsigned int)written > remaining) {
+            written = (int)remaining;
+        }
+        g_music_pending_offset += (unsigned int)written;
+
+        if (g_music_pending_offset < g_music_pending_samples) {
+            return;
+        }
+
+        g_music_pending_buffer = NULL;
+        g_music_pending_samples = 0;
+        g_music_pending_offset = 0;
+    }
+
+    /*
+     * rom_browser_draw() is called once per vblank (nominally 60 Hz). Polling
+     * a 20 ms timer from that loop quantizes tracker ticks to either one or
+     * two display frames and can repeatedly turn 20 ms into 33 ms. A
+     * fractional frame accumulator instead schedules the correct average
+     * cadence smoothly: at 50 Hz it skips one out of every six display frames.
+     */
+    g_music_fallback_phase += 1000000ULL;
+    {
+        uint64_t threshold =
+            (uint64_t)g_music_fallback_frame_time * MUSIC_DISPLAY_RATE;
+
+        if (g_music_fallback_phase < threshold) {
+            return;
+        }
+        g_music_fallback_phase -= threshold;
+    }
+
+    ret = xmp_play_frame(g_xmp_ctx);
+    if (ret < 0) {
+        xmp_restart_module(g_xmp_ctx);
+        return;
+    }
+
+    xmp_get_frame_info(g_xmp_ctx, &fi);
+
+    if (fi.buffer && fi.buffer_size >= 4) {
+        /* libxmp reports buffer_size in bytes; 16-bit stereo = 4 bytes/pair. */
+        unsigned int bytes = (unsigned int)fi.buffer_size;
+        bytes &= ~3u;
+
+        g_music_pending_buffer = (const uint8_t *)fi.buffer;
+        g_music_pending_samples = bytes / 4u;
+        g_music_pending_offset = 0;
+
+        /* Mix the OGG effect into a persistent copy, never into libxmp's
+         * internal buffer. The copy stays valid across partial AICA writes. */
+        if (menu_select_sfx_has_active_voice() &&
+            bytes <= sizeof(g_music_mix_buffer)) {
+            memcpy(g_music_mix_buffer, fi.buffer, bytes);
+            mix_menu_select_sfx(g_music_mix_buffer,
+                                g_music_pending_samples);
+            g_music_pending_buffer = (const uint8_t *)g_music_mix_buffer;
+        }
+
+        /* Try to queue this frame immediately. If the ringbuffer is full, the
+         * remainder stays pending and is written on a later browser frame. */
+        {
+            int written = audio_write_stereo_data(
+                (void *)g_music_pending_buffer,
+                g_music_pending_samples
+            );
+
+            if (written < 0) {
+                return;
+            }
+            if ((unsigned int)written > g_music_pending_samples) {
+                written = (int)g_music_pending_samples;
+            }
+            g_music_pending_offset = (unsigned int)written;
+
+            if (g_music_pending_offset >= g_music_pending_samples) {
+                g_music_pending_buffer = NULL;
+                g_music_pending_samples = 0;
+                g_music_pending_offset = 0;
+            }
+        }
+    }
+
+    /*
+     * libxmp's frame_time reports the module's scanned/base duration and does
+     * not include the relative tempo factor. Apply the same inverse factor to
+     * the 60 Hz scheduler so audio samples are produced at exactly 44.1 kHz.
+     */
+    {
+        uint32_t frame_time = (fi.frame_time > 0)
+            ? (uint32_t)fi.frame_time
+            : 20000u;
+
+        if (g_music_speed_applied) {
+            frame_time = (uint32_t)(
+                ((uint64_t)frame_time * 100ULL +
+                 (MUSIC_SPEED_PERCENT / 2u)) / MUSIC_SPEED_PERCENT);
+        }
+
+        if (frame_time == 0) {
+            frame_time = 1;
+        }
+        g_music_fallback_frame_time = frame_time;
+    }
+}
+
+/* ------------------------------------------------------------------------- */
 /* Initialization                                                            */
 /* ------------------------------------------------------------------------- */
 
@@ -854,6 +1466,7 @@ void rom_browser_init(void)
         g_romfs_initialized = 1;
     }
     scan_romfs();
+    init_background_music();
 
     current_scroll = 0.0f;
     frame_counter = 0;
@@ -966,27 +1579,27 @@ void rom_browser_init(void)
 
 #ifdef FEATURE_FREETYPE
     {
-        extern uint8_t *dejavusans_ttf_data;
-        extern unsigned int dejavusans_ttf_len;
+        extern uint8_t *nes_font_ttf_data;
+        extern unsigned int nes_font_ttf_len;
 
         if (!font_18pt) {
-            font_18pt = font_add(dejavusans_ttf_data, dejavusans_ttf_len);
+            font_18pt = font_add(nes_font_ttf_data, nes_font_ttf_len);
             if (font_18pt) {
-                font_set_size(font_18pt, 18);
+                font_set_size(font_18pt, 16);
             }
         }
 
         if (!font_14pt) {
-            font_14pt = font_add(dejavusans_ttf_data, dejavusans_ttf_len);
+            font_14pt = font_add(nes_font_ttf_data, nes_font_ttf_len);
             if (font_14pt) {
-                font_set_size(font_14pt, 14);
+                font_set_size(font_14pt, 11);
             }
         }
 
         if (!font_24pt) {
-            font_24pt = font_add(dejavusans_ttf_data, dejavusans_ttf_len);
+            font_24pt = font_add(nes_font_ttf_data, nes_font_ttf_len);
             if (font_24pt) {
-                font_set_size(font_24pt, 24);
+                font_set_size(font_24pt, 20);
             }
         }
     }
@@ -1017,7 +1630,7 @@ static void draw_footer(void)
     const int base_y = 450;
     const float btn_size = 40.0f;
     const float joy_size = 48.0f;
-    const int text_y = 455;
+    const int text_y = 460;
 
     int joy_frame = (frame_counter / 20) % 4;
     texture_description_t *current_joy = joy1_tex;
@@ -1035,13 +1648,15 @@ static void draw_footer(void)
     if (current_joy && current_joy->height > 0) {
         float scale = joy_size / (float)current_joy->height;
         int width = (int)((float)current_joy->width * scale);
-        int joy_y = base_y - (int)joy_size + 10;
+        int joy_y = base_y - (int)joy_size + 5;
 
         sprite_draw_scaled(20, joy_y, scale, scale, current_joy);
 
-        if (font_18pt) {
-            ta_draw_text(20 + (width / 2) - 25, text_y,
-                         font_18pt, rgb(255, 255, 255), "Select");
+        if (font_14pt) {
+            font_metrics_t metrics = font_get_text_metrics(font_14pt, "SELECT");
+            int text_x = 20 + ((width - (int)metrics.width) / 2);
+            ta_draw_text(text_x, text_y,
+                         font_14pt, rgb(255, 255, 255), "SELECT");
         }
     }
 
@@ -1051,23 +1666,174 @@ static void draw_footer(void)
         int btn_y = base_y - (int)btn_size + 18;
 
         sprite_draw_scaled(85, btn_y, scale, scale, btn_main_tex);
-        if (font_18pt) {
-            ta_draw_text(85 + (width / 2) - 5, text_y,
-                         font_18pt, rgb(255, 255, 255), "A");
+        if (font_14pt) {
+            font_metrics_t metrics = font_get_text_metrics(font_14pt, "A");
+            int text_x = 85 + ((width - (int)metrics.width) / 2);
+            ta_draw_text(text_x, text_y,
+                         font_14pt, rgb(255, 255, 255), "A");
         }
 
         sprite_draw_scaled(135, btn_y, scale, scale, btn_main_tex);
-        if (font_18pt) {
-            ta_draw_text(135 + (width / 2) - 5, text_y,
-                         font_18pt, rgb(255, 255, 255), "B");
+        if (font_14pt) {
+            font_metrics_t metrics = font_get_text_metrics(font_14pt, "B");
+            int text_x = 135 + ((width - (int)metrics.width) / 2);
+            ta_draw_text(text_x, text_y,
+                         font_14pt, rgb(255, 255, 255), "B");
         }
 
-        sprite_draw_scaled(195, btn_y, scale, scale, btn_main_tex);
-        if (font_18pt) {
-            ta_draw_text(195 + (width / 2) - 18, text_y,
-                         font_18pt, rgb(255, 255, 255), "Start");
+        int start_x = (640 - width) / 2;
+        sprite_draw_scaled(start_x, btn_y, scale, scale, btn_main_tex);
+        if (font_14pt) {
+            font_metrics_t metrics = font_get_text_metrics(font_14pt, "START");
+            int text_x = start_x + ((width - (int)metrics.width) / 2);
+            ta_draw_text(text_x, text_y,
+                         font_14pt, rgb(255, 255, 255), "START");
         }
     }
+
+#ifdef FEATURE_FREETYPE
+    /*
+     * NES-style life bar.
+     * A thick white frame surrounds a dark track. The red fill is built from
+     * larger pixel-like blocks with a stepped bright-to-dark red gradient.
+     * Its fill follows current_scroll, including the eased carousel motion.
+     */
+    if (font_14pt && g_rom_count > 0) {
+        enum {
+            LIFE_BAR_WIDTH = 131,
+            LIFE_BAR_HEIGHT = 20,
+            LIFE_BAR_FRAME = 3,
+            LIFE_BAR_SEGMENTS = 14,
+            LIFE_BAR_SEGMENT_WIDTH = 8,
+            LIFE_BAR_SEGMENT_GAP = 1,
+            LIFE_BAR_TEXT_GAP = 14,
+            LIFE_BAR_RIGHT_EDGE = 620
+        };
+
+        static const uint8_t red_gradient[LIFE_BAR_SEGMENTS][3] = {
+            {255,  92,  92},
+            {255,  78,  78},
+            {255,  66,  66},
+            {250,  57,  57},
+            {244,  49,  51},
+            {237,  43,  47},
+            {229,  37,  44},
+            {220,  32,  42},
+            {210,  27,  39},
+            {199,  23,  36},
+            {187,  19,  34},
+            {175,  16,  31},
+            {160,  13,  29},
+            {145,  10,  27}
+        };
+
+        char position_text[16];
+        font_metrics_t metrics;
+        int current_index;
+        int text_x;
+        int bar_x;
+        int bar_y;
+        int inner_x;
+        int inner_y;
+        int inner_width;
+        int inner_height;
+        int filled_pixels;
+        int i;
+        float progress;
+
+        /* Show the nearest card while keeping the last card at N/N before wrap. */
+        current_index = (int)floorf(current_scroll + 0.5f);
+        if (current_index < 0) {
+            current_index = 0;
+        }
+        if (current_index >= g_rom_count) {
+            current_index = g_rom_count - 1;
+        }
+
+        snprintf(position_text, sizeof(position_text),
+                 "%d : %d", current_index + 1, g_rom_count);
+
+        metrics = font_get_text_metrics(font_14pt, "%s", position_text);
+        text_x = LIFE_BAR_RIGHT_EDGE - (int)metrics.width;
+        bar_x = text_x - LIFE_BAR_TEXT_GAP - LIFE_BAR_WIDTH;
+
+        /* Center the bar against the font's line box, with a small optical
+         * correction for the glyphs' baseline placement in ta_draw_text(). */
+        bar_y = text_y + ((int)metrics.height - LIFE_BAR_HEIGHT) / 2 + 1;
+
+        inner_x = bar_x + LIFE_BAR_FRAME;
+        inner_y = bar_y + LIFE_BAR_FRAME;
+        inner_width = LIFE_BAR_WIDTH - (LIFE_BAR_FRAME * 2);
+        inner_height = LIFE_BAR_HEIGHT - (LIFE_BAR_FRAME * 2);
+
+        progress = (current_scroll + 1.0f) / (float)g_rom_count;
+        if (progress < 0.0f) {
+            progress = 0.0f;
+        }
+        if (progress > 1.0f) {
+            progress = 1.0f;
+        }
+
+        filled_pixels = (int)floorf(
+            (progress * (float)inner_width) + 0.5f
+        );
+        if (filled_pixels > inner_width) {
+            filled_pixels = inner_width;
+        }
+
+        /* Thick, clean white outer frame. */
+        sprite_draw_box(
+            bar_x,
+            bar_y,
+            bar_x + LIFE_BAR_WIDTH - 1,
+            bar_y + LIFE_BAR_HEIGHT - 1,
+            rgb(255, 255, 255)
+        );
+
+        /* Recessed dark track visible wherever the red fill has not reached. */
+        sprite_draw_box(
+            inner_x,
+            inner_y,
+            inner_x + inner_width - 1,
+            inner_y + inner_height - 1,
+            rgb(28, 28, 32)
+        );
+
+        /* Fourteen wider pixel blocks form a stepped red gradient. */
+        for (i = 0; i < LIFE_BAR_SEGMENTS; i++) {
+            int segment_start = i *
+                (LIFE_BAR_SEGMENT_WIDTH + LIFE_BAR_SEGMENT_GAP);
+            int segment_fill = filled_pixels - segment_start;
+
+            if (segment_fill <= 0) {
+                continue;
+            }
+            if (segment_fill > LIFE_BAR_SEGMENT_WIDTH) {
+                segment_fill = LIFE_BAR_SEGMENT_WIDTH;
+            }
+
+            sprite_draw_box(
+                inner_x + segment_start,
+                inner_y,
+                inner_x + segment_start + segment_fill - 1,
+                inner_y + inner_height - 1,
+                rgb(red_gradient[i][0],
+                    red_gradient[i][1],
+                    red_gradient[i][2])
+            );
+        }
+
+        /* Position / library total. */
+        ta_draw_text(
+            text_x,
+            text_y,
+            font_14pt,
+            rgb(255, 255, 255),
+            "%s",
+            position_text
+        );
+    }
+#endif
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1078,6 +1844,8 @@ void rom_browser_draw(int selected)
 {
     int base_idx;
     float offset;
+
+    update_background_music();
 
     if (g_rom_count > 0) {
         if (selected < 0) {
@@ -1113,6 +1881,11 @@ void rom_browser_draw(int selected)
             /* Schedule the newly entering cover as soon as the requested
              * selection changes. Do not wait for the viewport boundary. */
             if (selected != g_last_requested_selected) {
+                /* Do not play on the initial selection; only on user navigation. */
+                if (g_last_requested_selected >= 0) {
+                    play_menu_select_sfx();
+                }
+
                 if (fabsf(diff) >= 0.01f) {
                     int direction = (diff > 0.0f) ? 1 : -1;
                     g_priority_cover_index = wrap_index(selected + (direction * 2));
@@ -1226,8 +1999,8 @@ void rom_browser_draw(int selected)
     }
 
     if (logo_tex) {
-        const float logo_scale = 0.25f;
-        sprite_draw_scaled(10, -25, logo_scale, logo_scale, logo_tex);
+        const float logo_scale = 0.30f;
+        sprite_draw_scaled(10, -40, logo_scale, logo_scale, logo_tex);
     }
 
     if (g_rom_count == 0) {
@@ -1245,6 +2018,7 @@ void rom_browser_draw(int selected)
             const char *name = g_rom_names[selected];
             char *dot;
             int text_x;
+            font_metrics_t metrics;
 
             strncpy(display_name, name, ROM_NAME_LEN - 1);
             display_name[ROM_NAME_LEN - 1] = '\0';
@@ -1254,12 +2028,18 @@ void rom_browser_draw(int selected)
                 *dot = '\0';
             }
 
-            text_x = 320 - (int)((float)strlen(display_name) * 4.5f);
+            for (int i = 0; display_name[i] != '\0'; i++) {
+                display_name[i] = (char)toupper((unsigned char)display_name[i]);
+            }
+
+            metrics = font_get_text_metrics(font_18pt, "%s", display_name);
+            text_x = (640 - (int)metrics.width) / 2;
             ta_draw_text(text_x, 400, font_18pt,
                          rgb(255, 255, 255), "%s", display_name);
         }
 #endif
     }
+
 
     draw_footer();
 

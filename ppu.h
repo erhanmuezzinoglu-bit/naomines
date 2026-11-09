@@ -116,6 +116,10 @@ void ppu_step_cycles(ppu_t *ppu, uint32_t cycles);
 void ppu_step_sampled(ppu_t *ppu, uint32_t cycles, uint8_t *nmi_last, int *nmi_pending);
 int ppu_dots_to_next_event(const ppu_t *ppu);
 void ppu_draw(const ppu_t *ppu);
+
+/* Hizli mod (EXP_FAST_PPU): sprite hatti satir basina tek seferde hesaplanir. Bit-exact degildir. */
+void ppu_set_fast_sprites(int on);
+int  ppu_get_fast_sprites(void);
 uint8_t ppu_cpu_read(ppu_t *ppu, uint16_t addr);
 void ppu_cpu_write(ppu_t *ppu, uint16_t addr, uint8_t val);
 

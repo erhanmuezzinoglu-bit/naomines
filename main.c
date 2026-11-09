@@ -259,6 +259,9 @@ int main(void)
 
             if (in.edge.player1.button4) autorun = !autorun;
 
+            /* B3: PPU sprite modu (dogruluk <-> HIZLI, bit-exact degil; bkz. exp_config.h EXP_FAST_PPU). */
+            if (in.edge.player1.button3) ppu_set_fast_sprites(!ppu_get_fast_sprites());
+
             if (in.edge.player1.button5) {
                 emu_driver_reset_from_vector();
             }
@@ -341,7 +344,7 @@ int main(void)
             video_draw_debug_text(
                 8, 24, rgb(255, 230, 80),
                 "emu:%lu aud:%lu draw:%lu hud:%lu wait:%lu in:%lu txt:%lu us%s\n"
-                "NES %lu.%lu fps  blit:%d nofill:%d turbo:%d  M%d  ff:%lu",
+                "NES %lu.%lu fps  blit:%d nofill:%d turbo:%d  M%d  ff:%lu  ppu:%s",
                 avg_emu, avg_aud, avg_draw, avg_hud, avg_wait, avg_in, avg_txt,
                 prof_have ? "" : " (olculuyor)",
                 avg_nes_fps10 / 10, avg_nes_fps10 % 10,
@@ -351,7 +354,8 @@ int main(void)
 #else
                 0,
 #endif
-                ff_last_frame
+                ff_last_frame,
+                ppu_get_fast_sprites() ? "HIZLI" : "dogru"
                 );
 #endif
 #if EXP_ABLATE
@@ -373,8 +377,9 @@ int main(void)
             }
 #endif
 #if EXP_FPS_HUD && !EXP_PROFILE
-            video_draw_debug_text(8, 24, rgb(255, 230, 80), "NES %lu.%lu fps  ff:%lu",
-                                  avg_nes_fps10 / 10, avg_nes_fps10 % 10, ff_last_frame);
+            video_draw_debug_text(8, 24, rgb(255, 230, 80), "NES %lu.%lu fps  ff:%lu  ppu:%s",
+                                  avg_nes_fps10 / 10, avg_nes_fps10 % 10, ff_last_frame,
+                                  ppu_get_fast_sprites() ? "HIZLI" : "dogru");
 #endif
             profile_end_into(p, &t_txt);
         }

@@ -508,6 +508,52 @@ static void sprite_fetch_dot(ppu_t *ppu, int sl, int c)
 /* Bir fetch slotunun TAM 8 dot'u (off 0..7) icin sprite_fetch_dot'un satir satir yansimasi.
  * vd == 257 (oam2_addr sifirlama) kapsam disi: cagiran yalnizca vd > 257 ve (vd-257)%8==0
  * icin kullanir. Durum yerel degiskenlerde tutulur; load_slot'tan once geri yazilir. */
+/* ---- HIZLI MOD: satir basina sprite hesabi (bkz. exp_config.h EXP_FAST_PPU) ---- */
+static int g_ppu_fast_sprites = EXP_FAST_PPU;
+
+void ppu_set_fast_sprites(int on) { g_ppu_fast_sprites = on ? 1 : 0; }
+int  ppu_get_fast_sprites(void)   { return g_ppu_fast_sprites; }
+
+/* Cycle 257'de cagrilir (render acik, sl < 240 veya sl == 261). Normal pipeline'in o satir icin uretecegi sonucu
+ * tek seferde uretir: OAM'den ilk 8 sprite (OAM sirasiyla), ikincil OAM'e kopya (attr 0xE3 maskeli), spr0_sec,
+ * eval_found; sonra her slot icin sprite_load_slot (ayni desen yukleme). 9. sprite varsa tasma bayragi hemen. */
+static void fast_sprite_line(ppu_t *ppu, int sl)
+{
+    if (sl < 240) {
+        const int height = (ppu->reg_ctrl & 0x20) ? 16 : 8;
+        const uint8_t *const o = ppu->oam;
+        uint8_t *const sec = ppu->sec_oam;
+        int found = 0;
+        memset(sec, 0xFF, 32);
+        ppu->spr0_sec = 0;
+        for (int i = 0; i < 64; i++) {
+            const uint8_t y = o[4 * i];
+            if ((unsigned)(sl - (int)y) < (unsigned)height) {
+                if (found < 8) {
+                    sec[4 * found + 0] = y;
+                    sec[4 * found + 1] = o[4 * i + 1];
+                    sec[4 * found + 2] = (uint8_t)(o[4 * i + 2] & 0xE3);
+                    sec[4 * found + 3] = o[4 * i + 3];
+                    if (i == 0) ppu->spr0_sec = 1;
+                    found++;
+                } else {
+                    ppu->reg_status |= 0x20;   /* sprite tasmasi */
+                    break;
+                }
+            }
+        }
+        ppu->eval_found = (uint8_t)found;
+    }
+    for (int k = 0; k < 8; k++) {
+        const uint8_t *const b = &ppu->sec_oam[4 * k];
+        ppu->fetch_byte[0] = b[0]; ppu->fetch_byte[1] = b[1]; ppu->fetch_byte[2] = b[2]; ppu->fetch_byte[3] = b[3];
+        sprite_load_slot(ppu, sl, k);
+    }
+    ppu->oam_addr = 0;
+    ppu->oam2_addr = 0;
+    ppu->oam2_frozen = 1;
+}
+
 static inline void sprite_fetch_slot_full(ppu_t *ppu, int sl, int slot)
 {
     uint8_t a = ppu->oam2_addr, fz = ppu->oam2_frozen;
@@ -1656,7 +1702,7 @@ static inline __attribute__((always_inline)) void ppu_dot(ppu_t *ppu) {
                     ppu->sps_irregular = 0;
                 }
 
-                if (EXP_SPR_PIPE_ON && (vsl < 240 || vsl == 261)) {
+                if (EXP_SPR_PIPE_ON && !g_ppu_fast_sprites && (vsl < 240 || vsl == 261)) {
                     if (vd == 63 || vd == 255 || vd == 339) ppu->oam2_frozen = 0;
 
                     if (vd >= 1 && vd <= 64) {
@@ -1668,6 +1714,10 @@ static inline __attribute__((always_inline)) void ppu_dot(ppu_t *ppu) {
                     }
 
                     if (vd >= 257 && vd <= 320) ppu->oam_addr = 0;
+                }
+                else if (g_ppu_fast_sprites && cyc == 257 && (vsl < 240 || vsl == 261)) {
+                    /* HIZLI MOD: sonraki satirin sprite'lari simdi (render_scanline cycle 256'da bitti) */
+                    fast_sprite_line(ppu, vsl);
                 }
 
 #if PPU_FAST_SPECIAL
@@ -1853,7 +1903,7 @@ static inline __attribute__((always_inline)) void ppu_dot(ppu_t *ppu) {
                 }
             }
 
-            if (rendering && EXP_SPR_PIPE_ON && (vsl < 240 || vsl == 261)) {
+            if (rendering && EXP_SPR_PIPE_ON && !g_ppu_fast_sprites && (vsl < 240 || vsl == 261)) {
                 if (vd == 63 || vd == 255 || vd == 339) ppu->oam2_frozen = 0;
 
                 if (vd >= 1 && vd <= 64) {
@@ -1865,6 +1915,9 @@ static inline __attribute__((always_inline)) void ppu_dot(ppu_t *ppu) {
                 }
 
                 if (vd >= 257 && vd <= 320) ppu->oam_addr = 0;
+            }
+            else if (rendering && g_ppu_fast_sprites && ppu->cycle == 257 && (vsl < 240 || vsl == 261)) {
+                fast_sprite_line(ppu, vsl);
             }
         }
 
@@ -1955,14 +2008,14 @@ static inline __attribute__((always_inline)) uint32_t ppu_sprite_bulk(ppu_t *ppu
 
     const int cyc = ppu->cycle;
 
-#if EXP_ABLATE
-    if (!EXP_SPR_PIPE_ON) {
-        /* M2/M4 (SADECE OLCUM): sprite pipeline kapali; hizli yol A'da siradan dot'lar
-         * yalniz sayac + bozunma ilerletir. */
+    if (!EXP_SPR_PIPE_ON || g_ppu_fast_sprites) {
+        /* M2/M4 (olcum) veya HIZLI MOD: dot-dot sprite pipeline yok; siradan dot'lar yalniz sayac + bozunma
+         * ilerletir (sprite'lar fast_sprite_line ile cycle 257'de uretilir). Hizli modda cycle 337+ dot-dot kalir
+         * (vd==339 blogu ve cift-kare atlamasi icin). */
         uint32_t d;
         if (cyc >= 4 && cyc <= 255)        d = (uint32_t)(256 - cyc);
         else if (cyc >= 259 && cyc <= 335) d = (uint32_t)(336 - cyc);
-        else if (cyc >= 337)               d = (uint32_t)(341 - cyc);
+        else if (cyc >= 337 && !g_ppu_fast_sprites) d = (uint32_t)(341 - cyc);
         else return 0;
         if (d > maxd) d = maxd;
         int c2 = cyc + (int)d;
@@ -1971,7 +2024,6 @@ static inline __attribute__((always_inline)) uint32_t ppu_sprite_bulk(ppu_t *ppu
         ppu_decay_advance(ppu, d);
         return d;
     }
-#endif
 
     /* (1) Ikincil OAM temizleme: cycle 4..61 (vd 7..64). cycle 1/3 ozel oldugundan 4'ten baslar. */
     if (cyc >= 4 && cyc <= 61) {
@@ -2238,9 +2290,7 @@ static __attribute__((noinline)) uint32_t ppu_bulk(ppu_t *ppu, uint32_t maxd)
 static inline int ppu_bulk_candidate(const ppu_t *ppu)
 {
     if (!(ppu->reg_mask & 0x18) || ppu->scanline >= 240) return 1;
-#if EXP_ABLATE
-    if (!EXP_SPR_PIPE_ON) return 1;
-#endif
+    if (!EXP_SPR_PIPE_ON || g_ppu_fast_sprites) return 1;
     const int c = ppu->cycle;
     return (c >= 4 && c <= 61) ||
            (c >= 64 && c <= 250 && !(c & 1)) ||

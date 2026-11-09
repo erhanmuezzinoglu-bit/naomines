@@ -13,20 +13,30 @@
 #endif
 #define PROF_ACTIVE (EXP_PROFILE || EXP_FPS_HUD)
 
+/* HIZLI MOD (BIT-EXACT DEGIL): 1 = sprite hatti satir basina tek seferde hesaplanir (cycle 257'de): OAM'den ilk 8 sprite
+ * secilir, desenleri yuklenir; dot-dot temizleme/eval/fetch calismaz. Gorunen cikti normal oyunlarda ayni olmalidir;
+ * FARKLAR: sprite tasma bayragi (>8 sprite) cycle 257'de ve "gercek" kural ile (donanim hatasi modellenmez),
+ * OAMADDR/$2004 okumalari render sirasinda, OAM bozulmasi, render sirasinda $2003/$2004 yazimi, sprite fetch penceresi
+ * (257-320) icinde CHR/$2000 degisimi. Dogruluk testleri (AccuracyCoin/blargg) icin 0 birakin. Calisma zamaninda
+ * ppu_set_fast_sprites() ile degistirilebilir (main.c: B3 dugmesi). */
+#ifndef EXP_FAST_PPU
+#define EXP_FAST_PPU 0
+#endif
+
 /* Giris (maple/JVS) okuma sikligi: her EXP_INPUT_PERIOD dongu karesinde bir. 1: her karede (eski davranis).
  * 2 secilirse okuma maliyeti (~0.9 ms) yarilanir; kisa (<2 kare) tus vuruslari kacabilir. */
 #ifndef EXP_INPUT_PERIOD
-#define EXP_INPUT_PERIOD 2
+#define EXP_INPUT_PERIOD 1
 #endif
 
 /* 1: debug_hud_draw() (PC/OP/CPU satiri) cizilir. 0: cizilmez (surum derlemesi: EXP_PROFILE=0 EXP_BENCH=0 EXP_HUD=0). */
 #ifndef EXP_HUD
-#define EXP_HUD 0
+#define EXP_HUD 2
 #endif
 
 /* Zamanlama olcumu + HUD'a olcum satirlari. */
 #ifndef EXP_PROFILE
-#define EXP_PROFILE 0
+#define EXP_PROFILE 1
 #endif
 
 /* Dongudeki video_fill_screen() cagrisini kaldir. */
@@ -47,7 +57,7 @@
 
 /* Acilista bir kez CPU/cache kalibrasyon testi (~0.3 sn) kosar, sonucu HUD'a yazar. */
 #ifndef EXP_BENCH
-#define EXP_BENCH 0
+#define EXP_BENCH 1
 #endif
 
 /* 1: PPU her CPU cycle'inda degil, yalniz "disariya gorunur" olaylarda (VBL/NMI, mapper A12
@@ -92,7 +102,7 @@
  *   M9: M4 + golge PPU                                     -> M9-M4 = "olay-yalniz" PPU adimlama maliyeti
   */
 #ifndef EXP_ABLATE
-#define EXP_ABLATE 0
+#define EXP_ABLATE 1
 #endif
 
 #if EXP_ABLATE && !EXP_PROFILE

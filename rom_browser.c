@@ -25,12 +25,11 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <math.h>
-#include <limits.h>
 #include <ctype.h>
 #include <stdlib.h>
 
 #define MAX_ROMS          128
-#define ROM_NAME_LEN      64
+#define ROM_NAME_LEN      122 /* 121 filename bytes + NUL; fits main.c fullpath[128]. */
 #define COVER_CACHE_SIZE           7
 #define COVER_TEXTURE_SIZE         512
 #define COVER_TEXTURE_PIXELS       (COVER_TEXTURE_SIZE * COVER_TEXTURE_SIZE)
@@ -52,14 +51,14 @@
 #define MENU_SFX_FILE_PATH           "rom://menuhighlight.ogg"
 
 /* The tested menu music setting is 10% faster, with the same 44.1 kHz rate. */
-#define MUSIC_SPEED_PERCENT          110u
+#define MUSIC_SPEED_PERCENT          105u
 #define MUSIC_DISPLAY_RATE            60u
 
 /* OGG is decoded once at menu startup, then mixed into the tracker PCM. */
 #define MENU_SFX_OUTPUT_RATE         44100u
 #define MENU_SFX_MAX_SECONDS             3u
 #define MENU_SFX_VOICE_COUNT              4u
-#define MENU_SFX_GAIN_Q15             24576  /* 0.75; reduce if effect is too loud. */
+#define MENU_SFX_GAIN_Q15             32768  /* 1.00; unity gain before mixing with music. */
 #define MUSIC_MIX_BUFFER_BYTES        32768u
 
 /*
@@ -79,7 +78,6 @@ static int  g_rom_count = 0;
 
 static font_t *font_18pt = NULL;
 static font_t *font_14pt = NULL;
-static font_t *font_24pt = NULL;
 
 static texture_description_t *bg_tex = NULL;
 static texture_description_t *logo_tex = NULL;
@@ -123,7 +121,7 @@ typedef struct {
     void *vram;
     texture_description_t *desc;
     int rom_index;
-    int last_used;
+    uint32_t last_used;
     unsigned int source_width;
     unsigned int source_height;
 } cover_cache_t;
@@ -135,8 +133,9 @@ static uint16_t g_cover_upload_pixels[COVER_TEXTURE_PIXELS]
     __attribute__((aligned(32)));
 
 static float current_scroll = 0.0f;
-static int frame_counter = 0;
+static uint32_t frame_counter = 0;
 static int g_romfs_initialized = 0;
+static int g_romfs_scan_failed = 0;
 static int g_scroll_initialized = 0;
 static int g_last_requested_selected = -1;
 static int g_priority_cover_index = -1;
@@ -317,26 +316,67 @@ static int is_supported_texture_size(unsigned int size)
     }
 }
 
+/* ta_texture_desc_malloc_direct() creates a square texture from one UV size. */
+static texture_description_t *load_static_texture(uint8_t *data,
+                                                  unsigned int width,
+                                                  unsigned int height)
+{
+    if (!data || width != height || !is_supported_texture_size(width)) {
+        return NULL;
+    }
+
+    return ta_texture_desc_malloc_direct(
+        (int)width,
+        data,
+        TA_TEXTUREMODE_ARGB4444
+    );
+}
+
+static int has_nes_extension(const char *name, size_t length)
+{
+    const char *extension;
+
+    if (!name || length <= 4u) {
+        return 0;
+    }
+
+    extension = name + length - 4u;
+    return extension[0] == '.' &&
+           tolower((unsigned char)extension[1]) == 'n' &&
+           tolower((unsigned char)extension[2]) == 'e' &&
+           tolower((unsigned char)extension[3]) == 's';
+}
+
 static void scan_romfs(void)
 {
     DIR *dir = opendir("rom://");
     struct dirent *entry;
 
     g_rom_count = 0;
+    g_romfs_scan_failed = 0;
 
-    while (dir && (entry = readdir(dir)) != NULL && g_rom_count < MAX_ROMS) {
+    if (!dir) {
+        g_romfs_scan_failed = 1;
+        return;
+    }
+
+    while ((entry = readdir(dir)) != NULL && g_rom_count < MAX_ROMS) {
         size_t len = strlen(entry->d_name);
 
-        if (len > 4 && strcmp(entry->d_name + len - 4, ".nes") == 0) {
-            strncpy(g_rom_names[g_rom_count], entry->d_name, ROM_NAME_LEN - 1);
-            g_rom_names[g_rom_count][ROM_NAME_LEN - 1] = '\0';
-            g_rom_count++;
+        if (!has_nes_extension(entry->d_name, len)) {
+            continue;
         }
+
+        /* Do not store a truncated name: main.c must open the exact ROM path. */
+        if (len >= ROM_NAME_LEN) {
+            continue;
+        }
+
+        memcpy(g_rom_names[g_rom_count], entry->d_name, len + 1u);
+        g_rom_count++;
     }
 
-    if (dir) {
-        closedir(dir);
-    }
+    closedir(dir);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -641,7 +681,7 @@ static void release_static_texture(texture_description_t **texture)
 static int find_cover_slot(int protected_index, int selected)
 {
     int slot = -1;
-    int oldest = INT_MAX;
+    uint32_t oldest_age = 0;
     int i;
 
     /* Prefer an allocated but currently unused slot. */
@@ -655,6 +695,7 @@ static int find_cover_slot(int protected_index, int selected)
     /* Never overwrite a cover needed anywhere along the current transition. */
     for (i = 0; i < COVER_CACHE_SIZE; i++) {
         int cached_index = g_cover_cache[i].rom_index;
+        uint32_t age;
 
         if (!g_cover_cache[i].vram || !g_cover_cache[i].desc) {
             continue;
@@ -664,8 +705,9 @@ static int find_cover_slot(int protected_index, int selected)
             continue;
         }
 
-        if (g_cover_cache[i].last_used < oldest) {
-            oldest = g_cover_cache[i].last_used;
+        age = frame_counter - g_cover_cache[i].last_used;
+        if (slot < 0 || age > oldest_age) {
+            oldest_age = age;
             slot = i;
         }
     }
@@ -807,11 +849,16 @@ static void advance_cover_upload(void)
 
     if (result != 0) {
         mark_cover_slot_empty(g_upload_slot);
+        if (g_priority_cover_index == g_upload_rom_index) {
+            g_priority_cover_index = -1;
+        }
         g_upload_active = 0;
         g_upload_slot = -1;
         g_upload_rom_index = -1;
         g_upload_pixels = NULL;
         g_upload_next_y = 0;
+        g_upload_source_width = 0;
+        g_upload_source_height = 0;
         return;
     }
 
@@ -1481,65 +1528,56 @@ void rom_browser_init(void)
     g_upload_source_width = 0;
     g_upload_source_height = 0;
 
-    for (i = 0; i < COVER_CACHE_SIZE; i++) {
-        g_cover_cache[i].vram = NULL;
-        g_cover_cache[i].desc = NULL;
-        g_cover_cache[i].rom_index = -1;
-        g_cover_cache[i].last_used = 0;
-        g_cover_cache[i].source_width = 0;
-        g_cover_cache[i].source_height = 0;
-    }
-
     /* The background asset must be the new 512x512 version. Its centered
      * 320x240 artwork area is enlarged 2x when drawn, preserving the same
      * 640x480 visible composition as the previous 1024x1024 asset. */
     if (background_png_data &&
         background_png_width == BACKGROUND_TEXTURE_SIZE &&
         background_png_height == BACKGROUND_TEXTURE_SIZE) {
-        bg_tex = ta_texture_desc_malloc_direct(
-            BACKGROUND_TEXTURE_SIZE,
+        bg_tex = load_static_texture(
             background_png_data,
-            TA_TEXTUREMODE_ARGB4444
+            background_png_width,
+            background_png_height
         );
     }
 
     if (logo_png_data) {
-        logo_tex = ta_texture_desc_malloc_direct(
-            (int)logo_png_width,
+        logo_tex = load_static_texture(
             logo_png_data,
-            TA_TEXTUREMODE_ARGB4444
+            logo_png_width,
+            logo_png_height
         );
     }
 
     if (joy1_png_data) {
-        joy1_tex = ta_texture_desc_malloc_direct(
-            (int)joy1_png_width,
+        joy1_tex = load_static_texture(
             joy1_png_data,
-            TA_TEXTUREMODE_ARGB4444
+            joy1_png_width,
+            joy1_png_height
         );
     }
 
     if (joy2_png_data) {
-        joy2_tex = ta_texture_desc_malloc_direct(
-            (int)joy2_png_width,
+        joy2_tex = load_static_texture(
             joy2_png_data,
-            TA_TEXTUREMODE_ARGB4444
+            joy2_png_width,
+            joy2_png_height
         );
     }
 
     if (joy3_png_data) {
-        joy3_tex = ta_texture_desc_malloc_direct(
-            (int)joy3_png_width,
+        joy3_tex = load_static_texture(
             joy3_png_data,
-            TA_TEXTUREMODE_ARGB4444
+            joy3_png_width,
+            joy3_png_height
         );
     }
 
     if (btn_main_png_data) {
-        btn_main_tex = ta_texture_desc_malloc_direct(
-            (int)btn_main_png_width,
+        btn_main_tex = load_static_texture(
             btn_main_png_data,
-            TA_TEXTUREMODE_ARGB4444
+            btn_main_png_width,
+            btn_main_png_height
         );
     }
 
@@ -1592,16 +1630,10 @@ void rom_browser_init(void)
         if (!font_14pt) {
             font_14pt = font_add(nes_font_ttf_data, nes_font_ttf_len);
             if (font_14pt) {
-                font_set_size(font_14pt, 11);
+                font_set_size(font_14pt, 12);
             }
         }
 
-        if (!font_24pt) {
-            font_24pt = font_add(nes_font_ttf_data, nes_font_ttf_len);
-            if (font_24pt) {
-                font_set_size(font_24pt, 20);
-            }
-        }
     }
 #endif
 
@@ -1627,10 +1659,11 @@ const char *rom_browser_name(int index)
 
 static void draw_footer(void)
 {
-    const int base_y = 450;
+    const int base_y = 446;
     const float btn_size = 40.0f;
     const float joy_size = 48.0f;
-    const int text_y = 460;
+    const int text_y = 456;
+    const int left_group_shift = 10;
 
     int joy_frame = (frame_counter / 20) % 4;
     texture_description_t *current_joy = joy1_tex;
@@ -1650,11 +1683,11 @@ static void draw_footer(void)
         int width = (int)((float)current_joy->width * scale);
         int joy_y = base_y - (int)joy_size + 5;
 
-        sprite_draw_scaled(20, joy_y, scale, scale, current_joy);
+        sprite_draw_scaled(20 + left_group_shift, joy_y, scale, scale, current_joy);
 
         if (font_14pt) {
             font_metrics_t metrics = font_get_text_metrics(font_14pt, "SELECT");
-            int text_x = 20 + ((width - (int)metrics.width) / 2);
+            int text_x = 20 + left_group_shift + ((width - (int)metrics.width) / 2);
             ta_draw_text(text_x, text_y,
                          font_14pt, rgb(255, 255, 255), "SELECT");
         }
@@ -1665,18 +1698,18 @@ static void draw_footer(void)
         int width = (int)((float)btn_main_tex->width * scale);
         int btn_y = base_y - (int)btn_size + 18;
 
-        sprite_draw_scaled(85, btn_y, scale, scale, btn_main_tex);
+        sprite_draw_scaled(85 + left_group_shift, btn_y, scale, scale, btn_main_tex);
         if (font_14pt) {
             font_metrics_t metrics = font_get_text_metrics(font_14pt, "A");
-            int text_x = 85 + ((width - (int)metrics.width) / 2);
+            int text_x = 85 + left_group_shift + ((width - (int)metrics.width) / 2);
             ta_draw_text(text_x, text_y,
                          font_14pt, rgb(255, 255, 255), "A");
         }
 
-        sprite_draw_scaled(135, btn_y, scale, scale, btn_main_tex);
+        sprite_draw_scaled(135 + left_group_shift, btn_y, scale, scale, btn_main_tex);
         if (font_14pt) {
             font_metrics_t metrics = font_get_text_metrics(font_14pt, "B");
-            int text_x = 135 + ((width - (int)metrics.width) / 2);
+            int text_x = 135 + left_group_shift + ((width - (int)metrics.width) / 2);
             ta_draw_text(text_x, text_y,
                          font_14pt, rgb(255, 255, 255), "B");
         }
@@ -1694,9 +1727,11 @@ static void draw_footer(void)
 #ifdef FEATURE_FREETYPE
     /*
      * NES-style life bar.
-     * A thick white frame surrounds a dark track. The red fill is built from
-     * larger pixel-like blocks with a stepped bright-to-dark red gradient.
-     * Its fill follows current_scroll, including the eased carousel motion.
+     * The dark track and red fill are drawn first; the four white frame
+     * edges are drawn last as solid strips so neither horizontal edge can
+     * be covered by the interior. Red is deliberately flat and hard-edged:
+     * each segment is one solid pixel-art block, with no soft highlights,
+     * shadows, or sub-block shading.
      */
     if (font_14pt && g_rom_count > 0) {
         enum {
@@ -1710,21 +1745,15 @@ static void draw_footer(void)
             LIFE_BAR_RIGHT_EDGE = 620
         };
 
+        /* Seven deliberately stepped red tones, each used for two blocks. */
         static const uint8_t red_gradient[LIFE_BAR_SEGMENTS][3] = {
-            {255,  92,  92},
-            {255,  78,  78},
-            {255,  66,  66},
-            {250,  57,  57},
-            {244,  49,  51},
-            {237,  43,  47},
-            {229,  37,  44},
-            {220,  32,  42},
-            {210,  27,  39},
-            {199,  23,  36},
-            {187,  19,  34},
-            {175,  16,  31},
-            {160,  13,  29},
-            {145,  10,  27}
+            {255,  64,  64}, {255,  64,  64},
+            {255,  48,  48}, {255,  48,  48},
+            {240,  32,  32}, {240,  32,  32},
+            {224,  24,  24}, {224,  24,  24},
+            {208,  16,  16}, {208,  16,  16},
+            {184,  12,  12}, {184,  12,  12},
+            {152,   8,   8}, {152,   8,   8}
         };
 
         char position_text[16];
@@ -1756,10 +1785,7 @@ static void draw_footer(void)
         metrics = font_get_text_metrics(font_14pt, "%s", position_text);
         text_x = LIFE_BAR_RIGHT_EDGE - (int)metrics.width;
         bar_x = text_x - LIFE_BAR_TEXT_GAP - LIFE_BAR_WIDTH;
-
-        /* Center the bar against the font's line box, with a small optical
-         * correction for the glyphs' baseline placement in ta_draw_text(). */
-        bar_y = text_y + ((int)metrics.height - LIFE_BAR_HEIGHT) / 2 + 1;
+        bar_y = text_y + ((int)metrics.height - LIFE_BAR_HEIGHT) / 2 - 3;
 
         inner_x = bar_x + LIFE_BAR_FRAME;
         inner_y = bar_y + LIFE_BAR_FRAME;
@@ -1781,16 +1807,7 @@ static void draw_footer(void)
             filled_pixels = inner_width;
         }
 
-        /* Thick, clean white outer frame. */
-        sprite_draw_box(
-            bar_x,
-            bar_y,
-            bar_x + LIFE_BAR_WIDTH - 1,
-            bar_y + LIFE_BAR_HEIGHT - 1,
-            rgb(255, 255, 255)
-        );
-
-        /* Recessed dark track visible wherever the red fill has not reached. */
+        /* Recessed dark track. */
         sprite_draw_box(
             inner_x,
             inner_y,
@@ -1799,7 +1816,7 @@ static void draw_footer(void)
             rgb(28, 28, 32)
         );
 
-        /* Fourteen wider pixel blocks form a stepped red gradient. */
+        /* Fourteen equal-height, solid-color blocks with crisp dark gaps. */
         for (i = 0; i < LIFE_BAR_SEGMENTS; i++) {
             int segment_start = i *
                 (LIFE_BAR_SEGMENT_WIDTH + LIFE_BAR_SEGMENT_GAP);
@@ -1822,6 +1839,40 @@ static void draw_footer(void)
                     red_gradient[i][2])
             );
         }
+
+        /*
+         * Draw the side rails at full height. The shorter top and bottom
+         * rails stop exactly at the inner edges of the side rails, creating
+         * a clean pixel-panel joint without extending past the corners.
+         */
+        sprite_draw_box(
+            bar_x,
+            bar_y,
+            bar_x + LIFE_BAR_FRAME - 1,
+            bar_y + LIFE_BAR_HEIGHT - 1,
+            rgb(255, 255, 255)
+        );
+        sprite_draw_box(
+            bar_x + LIFE_BAR_WIDTH - LIFE_BAR_FRAME,
+            bar_y,
+            bar_x + LIFE_BAR_WIDTH - 1,
+            bar_y + LIFE_BAR_HEIGHT - 1,
+            rgb(255, 255, 255)
+        );
+        sprite_draw_box(
+            bar_x + LIFE_BAR_FRAME,
+            bar_y,
+            bar_x + LIFE_BAR_WIDTH - LIFE_BAR_FRAME - 1,
+            bar_y + LIFE_BAR_FRAME - 1,
+            rgb(255, 255, 255)
+        );
+        sprite_draw_box(
+            bar_x + LIFE_BAR_FRAME,
+            bar_y + LIFE_BAR_HEIGHT - LIFE_BAR_FRAME,
+            bar_x + LIFE_BAR_WIDTH - LIFE_BAR_FRAME - 1,
+            bar_y + LIFE_BAR_HEIGHT - 1,
+            rgb(255, 255, 255)
+        );
 
         /* Position / library total. */
         ta_draw_text(
@@ -2000,14 +2051,17 @@ void rom_browser_draw(int selected)
 
     if (logo_tex) {
         const float logo_scale = 0.30f;
-        sprite_draw_scaled(10, -40, logo_scale, logo_scale, logo_tex);
+        sprite_draw_scaled(10, -36, logo_scale, logo_scale, logo_tex);
     }
 
     if (g_rom_count == 0) {
 #ifdef FEATURE_FREETYPE
         if (font_18pt) {
+            const char *message = g_romfs_scan_failed
+                ? "ROMFS ERROR"
+                : "NO ROMS FOUND";
             ta_draw_text(260, 75, font_18pt,
-                         rgb(255, 100, 100), "NO ROMS FOUND");
+                         rgb(255, 100, 100), "%s", message);
         }
 #endif
     }

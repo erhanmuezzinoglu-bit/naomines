@@ -1715,7 +1715,7 @@ static inline __attribute__((always_inline)) void ppu_dot(ppu_t *ppu) {
 
                     if (vd >= 257 && vd <= 320) ppu->oam_addr = 0;
                 }
-                else if (g_ppu_fast_sprites && cyc == 257 && (vsl < 240 || vsl == 261)) {
+                else if (EXP_SPR_PIPE_ON && g_ppu_fast_sprites && cyc == 257 && (vsl < 240 || vsl == 261)) {
                     /* HIZLI MOD: sonraki satirin sprite'lari simdi (render_scanline cycle 256'da bitti) */
                     fast_sprite_line(ppu, vsl);
                 }
@@ -1916,7 +1916,7 @@ static inline __attribute__((always_inline)) void ppu_dot(ppu_t *ppu) {
 
                 if (vd >= 257 && vd <= 320) ppu->oam_addr = 0;
             }
-            else if (rendering && g_ppu_fast_sprites && ppu->cycle == 257 && (vsl < 240 || vsl == 261)) {
+            else if (rendering && EXP_SPR_PIPE_ON && g_ppu_fast_sprites && ppu->cycle == 257 && (vsl < 240 || vsl == 261)) {
                 fast_sprite_line(ppu, vsl);
             }
         }
@@ -2015,7 +2015,7 @@ static inline __attribute__((always_inline)) uint32_t ppu_sprite_bulk(ppu_t *ppu
         uint32_t d;
         if (cyc >= 4 && cyc <= 255)        d = (uint32_t)(256 - cyc);
         else if (cyc >= 259 && cyc <= 335) d = (uint32_t)(336 - cyc);
-        else if (cyc >= 337 && !g_ppu_fast_sprites) d = (uint32_t)(341 - cyc);
+        else if (cyc >= 337 && (!g_ppu_fast_sprites || !EXP_SPR_PIPE_ON)) d = (uint32_t)(341 - cyc);
         else return 0;
         if (d > maxd) d = maxd;
         int c2 = cyc + (int)d;

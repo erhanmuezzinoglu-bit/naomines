@@ -16,6 +16,11 @@
 #include "nes_rom.h"
 #include "exp_config.h"
 
+/* Calisma zamani hizli-mod gecisi (B3). exp_config.h'ta tanimli degilse acik sayilir. */
+#ifndef EXP_FAST_PPU_TOGGLE
+#define EXP_FAST_PPU_TOGGLE 1
+#endif
+
 /* 1: ppu_dot hizli yol A, cycle 3/256/257/258 ozel dot'larini da kapsar (orijinal govdenin ayni isini
  * ayni sirayla yapar). 0: eski davranis (bu dot'lar orijinal govdeden gecer). Dogrulama referansi. */
 #ifndef PPU_FAST_SPECIAL
@@ -40,27 +45,15 @@
 #define PPU_FAST_BG_BLANK 0   /* SH-4'te olcuruldu: +0.6 ms yavaslatti (x86 komut sayimi tersini gosteriyordu); kapali */
 #endif
 
-#if EXP_ABLATE
-/* SADECE OLCUM: gercek oyunda PPU adimlamanin cagri/dot istatistigi (tam sayim, zamanlama yok). */
-unsigned long g_ps_calls, g_ps_dots, g_ps_c3, g_ps_small, g_ps_slow, g_ps_bulk_calls, g_ps_bulk_dots;
-unsigned long g_ps_s0, g_ps_bgrow, g_ps_dotwise;      /* agir fonksiyon cagrilari */
-unsigned long g_ps_cyc[7];                             /* yavas dot'lar: cycle sinifina gore */
-#define PS_STAT(x) (x)
-#else
 #define PS_STAT(x) ((void)0)
-#endif
 #include <naomi/video.h>
 #include <string.h>
 #include <stdbool.h>
 
 /* Mapper kancaları (mapper.c). */
 extern void mapper_scanline_clock(void);
-#if EXP_ABLATE
-extern int g_ppu_shadow_active;    /* golge PPU adimlanirken mapper'a dokunma (SADECE OLCUM) */
-#define MAPPER_CLOCK() do { if (!g_ppu_shadow_active) mapper_scanline_clock(); } while (0)
-#else
+extern int mapper_scanline_clocks_until_irq(void);
 #define MAPPER_CLOCK() mapper_scanline_clock()
-#endif
 
 /* ============================================================
  *  Sanal dot
@@ -134,12 +127,8 @@ enum {
 
 static void render_scanline(ppu_t *ppu);
 
-#if EXP_FAST_BLIT
 /* Donanim piksel formati (RGB0555, 16 bit). Satir basi 256 piksel. */
 typedef uint16_t scr_pixel_t;
-#else
-typedef color_t scr_pixel_t;
-#endif
 static scr_pixel_t screen_buffer[256 * 240] __attribute__((aligned(32)));
 
 static const uint8_t nintendo_power_up_palette[32] = {
@@ -186,7 +175,6 @@ static const uint32_t nes_palette_rgb[64] = {
     0xccd278, 0xb4de78, 0xa8e290, 0x98e2b4, 0xa0d6e4, 0xa0a2a0, 0x000000, 0x000000
     };
 
-#if EXP_FAST_BLIT
 
 static uint16_t s_pal16[64];
 /* 0: ppu_init cagrilmadi, 1: hizli blit, 2: yedek (yavas) yol: dikey monitor
@@ -235,16 +223,6 @@ static void ppu_blit_init(void)
 
 int ppu_blit_mode(void) { return s_blit_mode; }
 
-#else /* !EXP_FAST_BLIT: orijinal davranis */
-
-static inline scr_pixel_t nes_color_to_1555(uint8_t nes_color) {
-    uint32_t c = nes_palette_rgb[nes_color & 0x3F];
-    return rgb((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
-}
-
-int ppu_blit_mode(void) { return 0; }
-
-#endif
 
 static void ppu_a12_check(uint16_t old_v, uint16_t new_v)
 {
@@ -509,6 +487,31 @@ static void sprite_fetch_dot(ppu_t *ppu, int sl, int c)
  * vd == 257 (oam2_addr sifirlama) kapsam disi: cagiran yalnizca vd > 257 ve (vd-257)%8==0
  * icin kullanir. Durum yerel degiskenlerde tutulur; load_slot'tan once geri yazilir. */
 /* ---- HIZLI MOD: satir basina sprite hesabi (bkz. exp_config.h EXP_FAST_PPU) ---- */
+/* ---- A/B karsilastirma araclari (ab_core.h) ---- */
+uint32_t ppu_screen_line_hash(int y)
+{
+    const uint32_t *p = (const uint32_t *)&screen_buffer[y * 256];
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < 128; i++) { h ^= p[i]; h *= 16777619u; }
+    return h;
+}
+void ppu_copy_screen(uint16_t *dst) { memcpy(dst, screen_buffer, 256 * 240 * sizeof(uint16_t)); }
+void ppu_clear_screen(void) { memset(screen_buffer, 0, sizeof(screen_buffer)); }
+
+/* ---- KARE ATLAMA: gizli kare ----
+ * EXP_FRAME_SKIP > 0 iken main.c, gorunmeyecek karelerde ppu_set_render_skip(1) cagirir: satir ciziciler PIKSEL URETMEZ.
+ * CPU'nun gorebildigi hicbir sey degismez: sprite-0 carpisma bayragi (reg_status bit 6) ve sprite kaydirici (sps) durumu
+ * normal cizimdeki gibi korunur; yalnizca screen_buffer icerigi (gorunmeyen kare) farklidir. */
+#if EXP_FRAME_SKIP
+static int g_ppu_render_skip = 0;
+void ppu_set_render_skip(int on) { g_ppu_render_skip = on ? 1 : 0; }
+int  ppu_get_render_skip(void)   { return g_ppu_render_skip; }
+#else
+#define g_ppu_render_skip 0
+void ppu_set_render_skip(int on) { (void)on; }
+int  ppu_get_render_skip(void)   { return 0; }
+#endif
+
 static int g_ppu_fast_sprites = EXP_FAST_PPU;
 
 void ppu_set_fast_sprites(int on) { g_ppu_fast_sprites = on ? 1 : 0; }
@@ -557,7 +560,6 @@ static void fast_sprite_line(ppu_t *ppu, int sl)
 static inline void sprite_fetch_slot_full(ppu_t *ppu, int sl, int slot)
 {
     uint8_t a = ppu->oam2_addr, fz = ppu->oam2_frozen;
-#if PPU_FAST_SPRITE
     /* Bos slot: donmamis, 4'e hizali, tum 4 baytlik ikincil OAM bolumu 0xFF => dongunun sonucu sabit:
      * fetch_byte = FF*4, oam_buffer = FF, oam2_addr 4 artar (32'ye ulasirsa 0 ve donmus). */
     if (!fz && (a & 3u) == 0 && a <= 28u) {
@@ -572,7 +574,6 @@ static inline void sprite_fetch_slot_full(ppu_t *ppu, int sl, int slot)
             return;
         }
     }
-#endif
     uint8_t fb[4] = { ppu->fetch_byte[0], ppu->fetch_byte[1], ppu->fetch_byte[2], ppu->fetch_byte[3] };
     uint8_t buf = ppu->oam_buffer;
 
@@ -1222,7 +1223,6 @@ static void sps_end_of_fast_line(ppu_t *ppu)
  *  Farklar (sonuc ayni): yansitma tablosu (ppu_core_vram_mask switch'i yerine), yerel palet
  *  tablosu, kenar disi karolarda sinir kontrolsuz 8 piksel, bg_pixels istege bagli (NULL olabilir).
  * ============================================================ */
-#if PPU_FAST_BG_LUT
 /* spread[b]: b'nin bit (7-k)'si, 4*k. bitine tasinir (piksel k = soldan k. piksel). */
 static uint32_t s_spread[256];
 static void bg_spread_init(void)
@@ -1273,18 +1273,6 @@ void bg_line_fast_impl(ppu_t *ppu, uint8_t *restrict bg_pixels, const int has_bg
         const scr_pixel_t pal4[4] = { pal16[0], pal16[hi4 | 1], pal16[hi4 | 2], pal16[hi4 | 3] };
 
         const int px0 = tile * 8 - (int)fine_x;
-#if PPU_FAST_BG_BLANK
-        if ((p0 | p1) == 0 && tile != 0 && tile != 32) {
-            /* Tum pikseller c == 0 -> pal4[0]; bg_pixels = 0. */
-            scr_pixel_t *restrict d = dst + px0;
-            const scr_pixel_t c0 = pal4[0];
-            d[0] = c0; d[1] = c0; d[2] = c0; d[3] = c0; d[4] = c0; d[5] = c0; d[6] = c0; d[7] = c0;
-            if (has_bg) {
-                uint8_t *restrict b = bg_pixels + px0;
-                b[0] = 0; b[1] = 0; b[2] = 0; b[3] = 0; b[4] = 0; b[5] = 0; b[6] = 0; b[7] = 0;
-            }
-        } else
-#endif
         if (tile != 0 && tile != 32) {
             scr_pixel_t *restrict d = dst + px0;
 #define BGPX(K) do { \
@@ -1312,71 +1300,35 @@ static void render_bg_line_fast(ppu_t *ppu, uint8_t *restrict bg_pixels)
     if (bg_pixels) bg_line_fast_impl(ppu, bg_pixels, 1);
     else           bg_line_fast_impl(ppu, NULL, 0);
 }
-#else
-static void render_bg_line_fast(ppu_t *ppu, uint8_t *restrict bg_pixels)
-{
-    scr_pixel_t *restrict dst = &screen_buffer[ppu->scanline * 256];
-
-    uint16_t v       = ppu->line_latched ? ppu->line_v : ppu->v;
-    const uint8_t fine_x = ppu->line_latched ? ppu->line_x : ppu->x;
-    const uint16_t bg_base = (ppu->line_latched ? ppu->line_bg_hi : ((ppu->reg_ctrl & 0x10) != 0))
-                             ? 0x1000 : 0x0000;
-
-    /* palet: indeks (pal_hi<<2 | color); color==0 her zaman palette_ram[0] */
-    scr_pixel_t pal16[16];
-    for (int i = 0; i < 16; i++)
-        pal16[i] = nes_color_to_1555(ppu->palette_ram[(i & 3) ? i : 0]);
-
-    /* nametable yansitma: (addr>>10)&3 -> fiziksel taban */
-    uint16_t nt_base[4];
-    for (int i = 0; i < 4; i++)
-        nt_base[i] = (uint16_t)(ppu_core_vram_mask((uint16_t)(0x2000 + (i << 10)), ppu->mirroring) & 0x0C00);
-
-    const uint8_t *restrict vram = ppu->vram;
-
-    for (int tile = 0; tile < 33; tile++) {
-        const uint16_t nt_addr = 0x2000 | (v & 0x0FFF);
-        const uint8_t tile_idx = vram[0x2000 | nt_base[(nt_addr >> 10) & 3] | (nt_addr & 0x03FF)];
-
-        const uint16_t fine_y = (v >> 12) & 0x07;
-        const uint16_t p_addr = (uint16_t)(bg_base + tile_idx * 16 + fine_y);
-
-        const uint16_t at_addr = 0x23C0 | (v & 0x0C00) | ((v >> 4) & 0x38) | ((v >> 2) & 0x07);
-        const uint8_t attr = vram[0x2000 | nt_base[(at_addr >> 10) & 3] | (at_addr & 0x03FF)];
-        const unsigned hi4 = (unsigned)((attr >> (((v >> 4) & 4) | (v & 2))) & 0x03) << 2;
-
-        const unsigned p0 = vram[p_addr];
-        const unsigned p1 = vram[(uint16_t)(p_addr + 8)];
-
-        const int px0 = tile * 8 - (int)fine_x;
-        if (tile != 0 && tile != 32) {
-            /* tamamen [0,255] icinde */
-            scr_pixel_t *restrict d = dst + px0;
-#define BGPX(K) do { \
-                const unsigned c = ((p0 >> (7 - (K))) & 1u) | (((p1 >> (7 - (K))) & 1u) << 1); \
-                d[(K)] = pal16[c ? (hi4 | c) : 0]; \
-                if (bg_pixels) bg_pixels[px0 + (K)] = (uint8_t)c; \
-            } while (0)
-            BGPX(0); BGPX(1); BGPX(2); BGPX(3); BGPX(4); BGPX(5); BGPX(6); BGPX(7);
-#undef BGPX
-        } else {
-            for (int dot = 0; dot < 8; dot++) {
-                const int px = px0 + dot;
-                if (px < 0 || px >= 256) continue;
-                const unsigned c = ((p0 >> (7 - dot)) & 1u) | (((p1 >> (7 - dot)) & 1u) << 1);
-                dst[px] = pal16[c ? (hi4 | c) : 0];
-                if (bg_pixels) bg_pixels[px] = (uint8_t)c;
-            }
-        }
-        v_inc_coarse_x(&v);
-    }
-}
-
-#endif
 
 /* ============================================================
  *  Satır çizimi (dot 256'da)
  * ============================================================ */
+/* Sprite 0 carpismasi (satir sonu yolu): sprite 0'in opak pikseli opak bir BG pikselinin uzerine dusuyor mu?
+ * Cagiran: (reg_mask & 0x18) == 0x18 && spr_valid[0] && spr0_line saglanmis olmali. Hem normal hem gizli (kare atlama) yol
+ * AYNI islevi kullanir. */
+static inline bool spr0_line_hit(const ppu_t *ppu, const uint8_t *bg_pixels, bool left_clip)
+{
+    const uint8_t attr = ppu->spr_attr[0];
+    const uint8_t p0 = ppu->spr_lo[0];
+    const uint8_t p1 = ppu->spr_hi[0];
+    const int sx = ppu->spr_x[0];
+    const bool flip_x = (attr & 0x40) != 0;
+
+    for (int px = 0; px < 8; px++) {
+        const int draw_x = sx + px;
+        if (draw_x >= 256) break;
+        const uint8_t bit = flip_x ? px : (7 - px);
+        const uint8_t color = ((p0 >> bit) & 1) | (((p1 >> bit) & 1) << 1);
+        if (color == 0) continue;
+        if (bg_pixels[draw_x] != 0 && draw_x < 255) {
+            const int age_at_pixel = ppu->render_age - 1 - (256 - (draw_x + 1));
+            if (!(draw_x < 8 && left_clip) && age_at_pixel >= PPU_BG_FILL_DOTS) return true;
+        }
+    }
+    return false;
+}
+
 static void render_scanline(ppu_t *ppu) {
     if (ppu->scanline >= 240) return;
 
@@ -1393,6 +1345,22 @@ static void render_scanline(ppu_t *ppu) {
         }
         return;
     }
+
+#if EXP_FRAME_SKIP
+    if (g_ppu_render_skip) {
+        /* GIZLI KARE: piksel yok. Yalnizca sprite 0 carpismasi hesaplanir (normal yolun k == 0 mantigi AYNEN). */
+        if ((ppu->reg_mask & 0x18) == 0x18 && ppu->spr_valid[0] && ppu->spr0_line) {
+            uint8_t bgp[256];
+            if (ppu->bg_ev_count == 0) render_bg_line_fast(ppu, bgp);
+            else render_bg_row(ppu, bgp, 0, 0);
+
+            const bool lclip = !(ppu->reg_mask & 0x02) || !(ppu->reg_mask & 0x04);
+            if (spr0_line_hit(ppu, bgp, lclip)) ppu->reg_status |= 0x40;
+        }
+        sps_end_of_fast_line(ppu);
+        return;
+    }
+#endif
 
     uint8_t bg_pixels[256];
 
@@ -1417,6 +1385,7 @@ static void render_scanline(ppu_t *ppu) {
     bool both_on = (ppu->reg_mask & 0x18) == 0x18;
     bool left_clip = !(ppu->reg_mask & 0x02) || !(ppu->reg_mask & 0x04);
     bool hit = false;
+    if (both_on && ppu->spr0_line && ppu->spr_valid[0]) hit = spr0_line_hit(ppu, bg_pixels, left_clip);
 
     for (int k = 0; k < 8; k++) {
         if (!ppu->spr_valid[k]) continue;
@@ -1435,12 +1404,6 @@ static void render_scanline(ppu_t *ppu) {
             uint8_t bit = flip_x ? px : (7 - px);
             uint8_t color = ((p0 >> bit) & 1) | (((p1 >> bit) & 1) << 1);
             if (color == 0) continue;
-
-            if (k == 0 && ppu->spr0_line && both_on &&
-                bg_pixels[draw_x] != 0 && draw_x < 255) {
-                int age_at_pixel = ppu->render_age - 1 - (256 - (draw_x + 1));
-                if (!(draw_x < 8 && left_clip) && age_at_pixel >= PPU_BG_FILL_DOTS) hit = true;
-            }
 
             if (covered[draw_x]) continue;
             covered[draw_x] = 1;
@@ -1461,12 +1424,8 @@ void ppu_init(ppu_t *ppu) {
     for (int i = 0; i < 32; i++) {
         ppu->palette_ram[i] = nintendo_power_up_palette[i];
     }
-#if EXP_FAST_BLIT
-#if PPU_FAST_BG_LUT
     bg_spread_init();
-#endif
     ppu_blit_init();
-#endif
 }
 
 void ppu_reset(ppu_t *ppu) {
@@ -1681,20 +1640,14 @@ static inline __attribute__((always_inline)) void ppu_dot(ppu_t *ppu) {
             !ppu->oam_corrupt_pending &&
             !ppu->ovf_set_cycle && !ppu->spr0_hit_cycle) {
             const int cyc = ppu->cycle;
-#if PPU_FAST_SPECIAL
             /* Yalniz cycle 1 (satir basi blogu) yavas yolda kalir. 3/256/257/258 icin orijinal govdenin
              * (render acik, render_age doymus => rendering_v dogru) yaptigi ek isler asagida, ayni sirayla. */
             if (cyc != 1) {
-#else
-            if (cyc != 1 && cyc != 3 && cyc != 256 && cyc != 257 && cyc != 258) {
-#endif
                 int vsl, vd;
-#if PPU_FAST_SPECIAL
                 /* orijinal govde: cycle 256'da sprite asamasindan ONCE satiri ciz */
                 if (EXP_LINE_RENDER_ON && cyc == 256) {
                     render_scanline(ppu);
                 }
-#endif
                 spr_virtual_dot(ppu->scanline, cyc, &vsl, &vd);
 
                 if (vd == 339 && (vsl < 240 || vsl == 261)) {
@@ -1715,12 +1668,11 @@ static inline __attribute__((always_inline)) void ppu_dot(ppu_t *ppu) {
 
                     if (vd >= 257 && vd <= 320) ppu->oam_addr = 0;
                 }
-                else if (EXP_SPR_PIPE_ON && g_ppu_fast_sprites && cyc == 257 && (vsl < 240 || vsl == 261)) {
+                else if (g_ppu_fast_sprites && cyc == 257 && (vsl < 240 || vsl == 261)) {
                     /* HIZLI MOD: sonraki satirin sprite'lari simdi (render_scanline cycle 256'da bitti) */
                     fast_sprite_line(ppu, vsl);
                 }
 
-#if PPU_FAST_SPECIAL
                 /* orijinal govde: sprite asamasindan SONRA mapper A12 saati, sonra v guncellemeleri. */
                 if (cyc == 258 || cyc == 3) {
                     const int bg_bit  = (ppu->reg_ctrl & 0x10) ? 1 : 0;
@@ -1733,7 +1685,6 @@ static inline __attribute__((always_inline)) void ppu_dot(ppu_t *ppu) {
                 } else if (cyc == 257) {
                     ppu->v = (ppu->v & ~0x041F) | (ppu->t & 0x041F);
                 }
-#endif
 
                 if (++ppu->cycle >= 341) {
                     ppu->cycle = 0;
@@ -1747,14 +1698,12 @@ static inline __attribute__((always_inline)) void ppu_dot(ppu_t *ppu) {
                     ppu->reg_status |= 0x20;
                     ppu->ovf_set_cycle = 0;
                 }
-#if PPU_FAST_SPECIAL
                 /* render_scanline (cycle 256) spr0_hit_cycle kurmus olabilir: orijinal govdenin sonundaki kontrol. */
                 if (ppu->spr0_hit_cycle && ppu->cycle == ppu->spr0_hit_cycle &&
                     ppu->scanline < 240) {
                     ppu->reg_status |= 0x40;
                     ppu->spr0_hit_cycle = 0;
                 }
-#endif
                 return;
             }
         }
@@ -1916,7 +1865,7 @@ static inline __attribute__((always_inline)) void ppu_dot(ppu_t *ppu) {
 
                 if (vd >= 257 && vd <= 320) ppu->oam_addr = 0;
             }
-            else if (rendering && EXP_SPR_PIPE_ON && g_ppu_fast_sprites && ppu->cycle == 257 && (vsl < 240 || vsl == 261)) {
+            else if (rendering && g_ppu_fast_sprites && ppu->cycle == 257 && (vsl < 240 || vsl == 261)) {
                 fast_sprite_line(ppu, vsl);
             }
         }
@@ -2015,7 +1964,7 @@ static inline __attribute__((always_inline)) uint32_t ppu_sprite_bulk(ppu_t *ppu
         uint32_t d;
         if (cyc >= 4 && cyc <= 255)        d = (uint32_t)(256 - cyc);
         else if (cyc >= 259 && cyc <= 335) d = (uint32_t)(336 - cyc);
-        else if (cyc >= 337 && (!g_ppu_fast_sprites || !EXP_SPR_PIPE_ON)) d = (uint32_t)(341 - cyc);
+        else if (cyc >= 337 && !g_ppu_fast_sprites) d = (uint32_t)(341 - cyc);
         else return 0;
         if (d > maxd) d = maxd;
         int c2 = cyc + (int)d;
@@ -2074,7 +2023,6 @@ static inline __attribute__((always_inline)) uint32_t ppu_sprite_bulk(ppu_t *ppu
             if (phase == EVAL_RANGE) {
                 uint32_t q = 0;
                 uint8_t lastY = 0;
-#if PPU_FAST_SPRITE
                 if ((addr & 3u) == 0) {
                     /* Hizali adres: okunan her bayt bir Y (maske yok), adres 4'er artar, 256'ya ulasinca
                      * DONE + addr 0. Yukaridaki genel donguyle ayni sonuc. */
@@ -2094,7 +2042,6 @@ static inline __attribute__((always_inline)) uint32_t ppu_sprite_bulk(ppu_t *ppu
                         else            { addr = (uint8_t)na; }
                     }
                 } else
-#endif
                 while (p + q < pairs_max) {
                     const uint8_t y2 = oam_read_masked(ppu, addr);
                     if (spr_in_range(sl, y2, height)) break;
@@ -2233,9 +2180,6 @@ static inline __attribute__((always_inline)) uint32_t ppu_sprite_bulk(ppu_t *ppu
  * Hepsi hizli yol A/B/C'nin ardisik dot'lara uygulanmasinin kapali formudur. */
 static __attribute__((noinline)) uint32_t ppu_bulk(ppu_t *ppu, uint32_t maxd)
 {
-#if EXP_ABLATE
-    if (EXP_PPU_STEP_OFF) return 0;
-#endif
     const int sl = ppu->scanline;
     const int cyc = ppu->cycle;
 
@@ -2290,7 +2234,14 @@ static __attribute__((noinline)) uint32_t ppu_bulk(ppu_t *ppu, uint32_t maxd)
 static inline int ppu_bulk_candidate(const ppu_t *ppu)
 {
     if (!(ppu->reg_mask & 0x18) || ppu->scanline >= 240) return 1;
-    if (!EXP_SPR_PIPE_ON || g_ppu_fast_sprites) return 1;
+    if (!EXP_SPR_PIPE_ON || g_ppu_fast_sprites) {
+        /* Hizli mod ve ablasyon M2/M4/M9: toplu yol yalniz 4..255 ve 259..335'te (ablasyonda 337+ da) ilerler,
+         * digerlerinde ppu_sprite_bulk 0 doner; bos ppu_bulk cagrilarini onle (eskiden her dot icin 1 donuyordu:
+         * SH-4'te ~3-4 ms bosa gidiyor, M2/M4/M9 satirlarini sisiriyordu). */
+        const int cf = ppu->cycle;
+        if (g_ppu_fast_sprites) return (cf >= 4 && cf <= 255) || (cf >= 259 && cf <= 335);
+        return (cf >= 4 && cf <= 255) || (cf >= 259 && cf <= 335) || cf >= 337;
+    }
     const int c = ppu->cycle;
     return (c >= 4 && c <= 61) ||
            (c >= 64 && c <= 250 && !(c & 1)) ||
@@ -2311,14 +2262,6 @@ static __attribute__((noinline)) void ppu_run(
     const uint32_t grouped = nmi_last ? (cycles - (cycles % 3u)) : 0u;
     uint32_t k = 0;
 
-#if EXP_ABLATE
-    /* SADECE OLCUM: sprite pipeline kapaliyken eski sprite durumu (spr0_line / spr_valid) kalmasin;
-     * aksi halde sprite0_schedule_hit her satirda tam bg satiri cizer (olcum artefakti). */
-    if (!EXP_SPR_PIPE_ON) {
-        ppu->spr0_line = 0;
-        for (int q = 0; q < 8; q++) ppu->spr_valid[q] = 0;
-    }
-#endif
     PS_STAT(g_ps_calls++);
     PS_STAT(g_ps_dots += cycles);
     if (cycles == 3u)      { PS_STAT(g_ps_c3++); }
@@ -2344,14 +2287,6 @@ static __attribute__((noinline)) void ppu_run(
         }
 
         PS_STAT(g_ps_slow++);
-#if EXP_ABLATE
-        {
-            const int cc = ppu->cycle;
-            g_ps_cyc[ppu->scanline >= 240 ? 6 :
-                     cc == 0 ? 0 : cc == 1 ? 1 : cc <= 3 ? 2 : (cc >= 252 && cc <= 258) ? 3 :
-                     cc >= 336 ? 4 : 5]++;
-        }
-#endif
         ppu_dot(ppu);
 
         if (i < grouped) {
@@ -2405,13 +2340,24 @@ int ppu_dots_to_next_event(const ppu_t *ppu)
         const int t = (!bgb && spb) ? 258 : ((bgb && !spb) ? 3 : -1);
 
         if (t >= 0) {
-            int line = s;
-            if (!(line < 240 || line == 261) || t < c) {
-                line = (s + 1) % 262;
-                while (!(line < 240 || line == 261)) line = (line + 1) % 262;
+            /* CPU'ya gorunen A12 olayi = IRQ'nun yukselebilecegi saat (mapper_scanline_clocks_until_irq). Aradaki saatler
+             * yalniz mapper sayacini degistirir ve ppu_run icinde sirayla islenir. n = 1: siradaki saat. */
+            const int n = mapper_scanline_clocks_until_irq();
+            if (n > 0 && n <= 241) {
+                int line = s;
+                if (!(line < 240 || line == 261) || t < c) {
+                    line = (s + 1) % 262;
+                    while (!(line < 240 || line == 261)) line = (line + 1) % 262;
+                }
+                if (n > 1) {
+                    /* render satirlari sirasi: 261 -> 0..239 (kare basina 241 saat) */
+                    const int idx = (line == 261) ? 0 : line + 1;
+                    const int idx2 = (idx + n - 1) % 241;
+                    line = (idx2 == 0) ? 261 : idx2 - 1;
+                }
+                const int d = ppu_dots_to(s, c, line, t);
+                if (d < best) best = d;
             }
-            const int d = ppu_dots_to(s, c, line, t);
-            if (d < best) best = d;
         }
     }
     return best;
@@ -2419,7 +2365,6 @@ int ppu_dots_to_next_event(const ppu_t *ppu)
 
 void ppu_draw(const ppu_t *ppu) {
     (void)ppu;
-#if EXP_FAST_BLIT
     if (s_blit_mode == 1) {
         const unsigned w = video_width();
         uint16_t *fb = (uint16_t *)video_framebuffer();
@@ -2450,10 +2395,4 @@ void ppu_draw(const ppu_t *ppu) {
             }
         }
     }
-#else
-    int x_off = video_width() - 256 - 20, y_off = 40;
-    for (int y = 0; y < 240; y++) {
-        for (int x = 0; x < 256; x++) video_draw_pixel(x_off + x, y_off + y, screen_buffer[y * 256 + x]);
-    }
-#endif
 }

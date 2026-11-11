@@ -29,6 +29,7 @@ void emu_driver_ff_set_stop(int abs_ticks);
 extern unsigned long g_ff_cycles_total;   /* atlanan toplam cycle (istatistik) */
 extern unsigned long g_ff_events_total;   /* atlama sayisi */
 
+
 void emu_driver_init(fake6502_context *cpu,
                      ppu_t *ppu,
                      nes_input_t *in,

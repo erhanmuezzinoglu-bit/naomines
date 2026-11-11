@@ -2,127 +2,54 @@
 #define EXP_CONFIG_H
 
 /*
- * Deney anahtarlari (v2). Degeri degistirip "make" yapmak yeterli.
- * Her anahtar 0 yapildiginda ilgili kod ORIJINAL davranisa doner.
+ * naomines ayarlari. Tek anlamli, az sayida anahtar. Degeri degistirip "make" yapmak yeterli (veya -D ile verin).
  */
 
-/* 1: EXP_PROFILE kapaliyken bile tek satir "NES x.x fps" gosterilir (surum derlemesinde fps okumak icin;
- * maliyeti ~0.03 ms). EXP_PROFILE=1 ise zaten tam olcum satirlari gosterilir. */
-#ifndef EXP_FPS_HUD
-#define EXP_FPS_HUD 1
-#endif
-#define PROF_ACTIVE (EXP_PROFILE || EXP_FPS_HUD)
-
-/* HIZLI MOD (BIT-EXACT DEGIL): 1 = sprite hatti satir basina tek seferde hesaplanir (cycle 257'de): OAM'den ilk 8 sprite
- * secilir, desenleri yuklenir; dot-dot temizleme/eval/fetch calismaz. Gorunen cikti normal oyunlarda ayni olmalidir;
- * FARKLAR: sprite tasma bayragi (>8 sprite) cycle 257'de ve "gercek" kural ile (donanim hatasi modellenmez),
- * OAMADDR/$2004 okumalari render sirasinda, OAM bozulmasi, render sirasinda $2003/$2004 yazimi, sprite fetch penceresi
- * (257-320) icinde CHR/$2000 degisimi. Dogruluk testleri (AccuracyCoin/blargg) icin 0 birakin. Calisma zamaninda
- * ppu_set_fast_sprites() ile degistirilebilir (main.c: B3 dugmesi). */
-/* Hizli sprite yolu ile ablasyon olcumu icin varsayilan acik.
- * Dogruluk/FPS surum derlemesinde 0 yapilabilir veya B3 ile calisma zamaninda degistirilebilir. */
+/* Acilista sprite modu. 1: HIZLI (varsayilan): oynanista ~2-4 ms daha hizli; sprite tasma bayragi / $2004 okuma / OAM
+ * bozulmasi gibi ince donanim davranislari ve fetch penceresi icindeki CHR degisimi taklit edilmez. 0: DOGRULUK
+ * (AccuracyCoin 146/146, blargg testleri); agir oyunlarda (ornek Castlevania) 30 fps'i tutamayabilir. Calisirken B3 dugmesi ile
+ * degistirilir. Testler icin B3 ile "ppu:dogru" yapin. */
 #ifndef EXP_FAST_PPU
 #define EXP_FAST_PPU 1
 #endif
 
-/* Giris (maple/JVS) okuma sikligi: her EXP_INPUT_PERIOD dongu karesinde bir. 1: her karede (eski davranis).
- * 2 secilirse okuma maliyeti (~0.9 ms) yarilanir; kisa (<2 kare) tus vuruslari kacabilir. */
+/* Oyun calisirken START'i bu kadar milisaniye basili tutmak ana menuye doner (0: kapali). Uyari gostermez; tus daha
+ * once basili olsa bile sayilir. NES oyunu Start'i kendi islevi icin de gorur (ornek: duraklatma): kisa basis normaldir. */
+#ifndef EXP_MENU_HOLD_MS
+#define EXP_MENU_HOLD_MS 3000
+#endif
+
+/* 1: menuden secilen oyun B4'e basmadan hemen calisir (B4 duraklatma/surdurme olarak kalir). 0: eski davranis. */
+#ifndef EXP_AUTORUN_ON_LOAD
+#define EXP_AUTORUN_ON_LOAD 1
+#endif
+
+/* Giris (maple/JVS) okuma sikligi: her EXP_INPUT_PERIOD dongu karesinde bir. 1: her karede. 2 secilirse okuma maliyeti
+ * (~0.9 ms) yarilanir; kisa (<2 kare) tus vuruslari kacabilir. */
 #ifndef EXP_INPUT_PERIOD
-#define EXP_INPUT_PERIOD 2
+#define EXP_INPUT_PERIOD 1
 #endif
 
-/* 1: debug_hud_draw() (PC/OP/CPU satiri) cizilir. 0: cizilmez (surum derlemesi: EXP_PROFILE=0 EXP_BENCH=0 EXP_HUD=0). */
-#ifndef EXP_HUD
-#define EXP_HUD 0
-#endif
-
-/* Zamanlama olcumu + HUD'a olcum satirlari. */
-#ifndef EXP_PROFILE
-#define EXP_PROFILE 0
-#endif
-
-/* Dongudeki video_fill_screen() cagrisini kaldir. */
-#ifndef EXP_NO_FILL
-#define EXP_NO_FILL 1
-#endif
-
-/* ppu.c: donanim formatinda uint16_t screen_buffer + palet LUT + satir blit. */
-#ifndef EXP_FAST_BLIT
-#define EXP_FAST_BLIT 1
-#endif
-
-/* Bir dongude kac emule frame (sadece sonuncusu cizilir, ara frame sesi atilir).
- * NOT: emulasyon baskin oldugu icin turbo bir fayda saglamaz; 1 birak. */
+/* Bir dongude kac emule frame (sadece sonuncusu cizilir). Emulasyon baskin oldugu icin 1 birak. */
 #ifndef EXP_TURBO_FRAMES
-#define EXP_TURBO_FRAMES 1
+#define EXP_TURBO_FRAMES 0
 #endif
 
-/* Acilista bir kez CPU/cache kalibrasyon testi (~0.3 sn) kosar, sonucu HUD'a yazar. */
-#ifndef EXP_BENCH
-#define EXP_BENCH 0
+/* KARE ATLAMA (varsayilan 0 = KAPALI): bir dongude (1 + EXP_FRAME_SKIP) NES karesi calistirilir; ilk EXP_FRAME_SKIP kare
+ * GIZLIDIR (satir ciziciler piksel uretmez, CPU'nun gorebildigi hicbir durum degismez: sprite-0 carpismasi dahil), yalniz
+ * sonuncusu ekrana cizilir. Tum karelerin SESI korunur. Sonuc: oyun HIZI artar (hafif oyunlarda tam hiz, 60 NES kare/sn),
+ * ekrana basilan kare sayisi azalir (1 icin en fazla 30 Hz; oyun agirsa 20 Hz'e inebilir). 1 onerilir.
+ * (2 ve uzeri: dongu basina 3+ kare = 2205+ ses ornegi; ses halkasi 2048 ornek oldugundan yazma bloklar, gecikme artar.) */
+#ifndef EXP_FRAME_SKIP
+#define EXP_FRAME_SKIP 1
 #endif
 
-/* 1: PPU her CPU cycle'inda degil, yalniz "disariya gorunur" olaylarda (VBL/NMI, mapper A12
- *    saati), PPU/kartus yazmac erisimlerinde ve komut sonlarinda senkronlanir (BIT-EXACT
- *    tasarlandi; AccuracyCoin/blargg ile dogrula). 0: eski cycle-basi senkron. */
-#ifndef EXP_LAZY_PPU
-#define EXP_LAZY_PPU 1
+#if EXP_FRAME_SKIP > 0 && EXP_TURBO_FRAMES > 1
+#error "EXP_FRAME_SKIP ile EXP_TURBO_FRAMES > 1 birlikte kullanilamaz"
 #endif
 
-/* 1: APU her CPU cycle'inda degil, yalniz CPU'ya gorunen olaylarda (DMC sayac reload'i,
- *    frame-sequencer olaylari), APU yazmac erisimlerinde ve ses bosaltmadan once
- *    senkronlanir; olay icermeyen cycle'lar kapali formda toplu ilerletilir (BIT-EXACT
- *    tasarlandi; AccuracyCoin/blargg ile dogrula). 0: eski cycle-basi senkron. */
-#ifndef EXP_LAZY_APU
-#define EXP_LAZY_APU 1
-#endif
-
-/* 1: "Bos dongu atlama" (idle-loop fast-forward, BIT-EXACT tasarlandi). CPU ayni yazmac durumuna
- *    donen, YALNIZ RAM/PRG okuyan, hicbir yazma/yavas bus erisimi yapmayan bir dongu (ornek:
- *    "LDA $10 / BEQ geri", "JMP kendisi") iki ardisik turda ayni durumda yakalanirsa, bir sonraki
- *    gorunur olaya (PPU/APU deadline'i) ve kare butcesine kadar olan tum turlar tek hamlede atlanir:
- *    clockticks ve komut sayaci ilerler, yazmaclar/bellek zaten ayni kalir. Gerektirir: EXP_LAZY_PPU=1
- *    ve EXP_LAZY_APU=1; EXP_ABLATE'de M5-M7 modlarinda kapali (olcum referansi). main.c her karede
- *    emu_driver_ff_set_stop() ile kare sinirini bildirmezse atlama yapilmaz. */
-#ifndef EXP_IDLE_FF
-#define EXP_IDLE_FF 1
-#endif
-
-/* SADECE OLCUM: emulasyon icinde zamanin nereye gittigini bulmak icin bilesenleri
- * sirayla devre disi birakir (autorun acikken kendiliginden modlar arasinda gezer).
- * Bu modlarda emulasyon DOGRU DEGILDIR (goruntu/ses bozulur). Olcum bitince 0 yap.
- *   M0: normal
- *   M1: APU adimi kapali                                  -> APU payi      = M0-M1
- *   M2: PPU sprite pipeline kapali                        -> sprite payi   = M0-M2
- *   M3: PPU satir cizicisi (render_scanline) kapali       -> cizici payi   = M0-M3
- *   M4: M1+M2+M3 (APU + sprite + cizici kapali)           -> kalan PPU     = M4-M5 (CPU is yuku farki da icerir!)
- *   M5: M4 + PPU adimlama tamamen kapali (CPU+bus+surucu; oyun vblank'ta bekler)
- *   M6: M5 + nes_bus_read/write dagitimi atlanir (RAM/PRG dogrudan)
- *   M7: M6 + surucu sarmalayicisi (DMC/PPU/APU sync, IRQ snapshot) atlanir = CPU cekirdegi
- *   M8: M0 + "golge PPU": ayni cagrilarla ikinci bir PPU kopyasi de adimlanir -> M8-M0 = TAM PPU adimlama maliyeti
- *       (CPU is yuku farkindan bagimsiz, dogrudan olcum)
- *   M9: M4 + golge PPU                                     -> M9-M4 = "olay-yalniz" PPU adimlama maliyeti
-  */
-#ifndef EXP_ABLATE
-#define EXP_ABLATE 0
-#endif
-
-#if EXP_ABLATE && !EXP_PROFILE
-#error "EXP_ABLATE icin EXP_PROFILE=1 gerekli"
-#endif
-
-#define EXP_NMODES 10
-
-#if EXP_ABLATE
-extern int g_exp_mode;
-#define EXP_APU_OFF        (g_exp_mode == 1 || g_exp_mode == 4 || (g_exp_mode >= 5 && g_exp_mode <= 7) || g_exp_mode == 9)
-#define EXP_PPU_STEP_OFF   (g_exp_mode >= 5 && g_exp_mode <= 7)
-#define EXP_SPR_PIPE_ON    (g_exp_mode != 2 && g_exp_mode != 4 && g_exp_mode != 9)
-#define EXP_LINE_RENDER_ON (g_exp_mode != 3 && g_exp_mode != 4 && g_exp_mode != 9)
-#define EXP_SHADOW_PPU     (g_exp_mode == 8 || g_exp_mode == 9)
-#else
+/* ppu.c icinde sabit kalan kullanimlar (olcum/ablasyon altyapisi kaldirildi). */
 #define EXP_SPR_PIPE_ON    1
 #define EXP_LINE_RENDER_ON 1
-#endif
 
 #endif

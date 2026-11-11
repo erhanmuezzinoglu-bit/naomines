@@ -116,6 +116,9 @@ extern void fake6502_step(
     fake6502_context *c
 );
 
+/* Tam-komut hizli yolu (coklu komut): dondurur = calisan cycle (0 = ilk komut reddedildi, durum degismedi: fake6502_step kullanin). */
+extern int fake6502_run_fast(fake6502_context *c, int stop_tick, int *n_out);
+
 #ifdef FAKE6502_OPS_STATIC
 
 #define FAKE6502_FN_OPCODE(m_name) \

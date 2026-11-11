@@ -24,115 +24,19 @@ static ppu_t ppu;
 static nes_input_t in;
 static nes_bus_t bus;
 
-#if EXP_ABLATE
-int g_exp_mode = 0;
-extern unsigned long g_ps_calls, g_ps_dots, g_ps_c3, g_ps_small, g_ps_slow, g_ps_bulk_calls, g_ps_bulk_dots;
-extern unsigned long g_ps_s0, g_ps_bgrow, g_ps_dotwise, g_ps_cyc[7];
-#define PS_N 17
-static unsigned long ps_acc[2][PS_N];       /* [0]: M0, [1]: M4 */
-static int ps_n[2];
-static unsigned long ps_avg[2][PS_N];
-#define PS_SNAP(a) do { (a)[0]=g_ps_calls; (a)[1]=g_ps_dots; (a)[2]=g_ps_c3; (a)[3]=g_ps_small; (a)[4]=g_ps_slow; (a)[5]=g_ps_bulk_calls; (a)[6]=g_ps_bulk_dots; \
-    (a)[7]=g_ps_s0; (a)[8]=g_ps_bgrow; (a)[9]=g_ps_dotwise; for (int q_=0;q_<7;q_++) (a)[10+q_]=g_ps_cyc[q_]; } while (0)
-#endif
+
 
 /* ------------------------------------------------------------------ */
 /* Kalibrasyon testi: CPU hizi ve cache davranisi                      */
 /* ------------------------------------------------------------------ */
-#if EXP_BENCH
-static volatile uint32_t bench_small[2048];      /*   8 KB: D-cache'e sigar    */
-static volatile uint32_t bench_big[262144];      /*   1 MB: D-cache'e sigmaz   */
-static volatile uint32_t bench_sink;
-static unsigned long bench_alu_x10, bench_small_x10, bench_big_x10;   /* ns*10 / islem */
-
-static unsigned long bench_ns_x10(uint64_t us, unsigned long iters)
-{
-    return (unsigned long)((us * 10000ULL) / iters);
-}
-
-static void bench_run(void)
-{
-    int h;
-    uint64_t us;
-    uint32_t x = 1;
-    uint32_t s;
-
-    /* 1) Saf ALU/dongu hizi: 2M iterasyon. */
-    h = profile_start();
-    for (uint32_t i = 0; i < 2000000u; i++) x = x * 1664525u + 1013904223u;
-    us = profile_end(h);
-    bench_sink = x;
-    bench_alu_x10 = bench_ns_x10(us, 2000000ul);
-
-    /* 2) 8 KB dizi, 1000 gecis: cache calisiyorsa hizli olmali. */
-    s = 0;
-    h = profile_start();
-    for (int pass = 0; pass < 1000; pass++)
-        for (int i = 0; i < 2048; i++) s += bench_small[i];
-    us = profile_end(h);
-    bench_sink = s;
-    bench_small_x10 = bench_ns_x10(us, 2048ul * 1000ul);
-
-    /* 3) 1 MB dizi, 32 bayt adimla (her erisim yeni cache satiri): ~2M erisim. */
-    s = 0;
-    h = profile_start();
-    for (int pass = 0; pass < 64; pass++)
-        for (int i = 0; i < 262144; i += 8) s += bench_big[i];
-    us = profile_end(h);
-    bench_sink = s;
-    bench_big_x10 = bench_ns_x10(us, 32768ul * 64ul);
-}
-
-static void bench_draw(int y)
-{
-    video_draw_debug_text(
-        8, y, rgb(150, 200, 255),
-        "BENCH ns/islem  alu:%lu.%lu  8KB:%lu.%lu  1MB:%lu.%lu",
-        bench_alu_x10 / 10, bench_alu_x10 % 10,
-        bench_small_x10 / 10, bench_small_x10 % 10,
-        bench_big_x10 / 10, bench_big_x10 % 10);
-}
-#endif
 
 /* ------------------------------------------------------------------ */
 /* Ablasyon olcumu                                                     */
 /* ------------------------------------------------------------------ */
-#if EXP_ABLATE
-#define ABL_LOOPS 5       /* her modda olculen emulasyon dongusu sayisi */
-
-static const char *const abl_name[EXP_NMODES] = {
-    "base", "noAPU", "noSprPipe", "noLineRnd", "allOff",
-    "noPPUstep", "bypassBus", "CPUonly", "dupFull", "dupMin"
-};
-static unsigned long abl_us[EXP_NMODES];      /* us / NES frame */
-static int abl_valid[EXP_NMODES];
-static uint64_t abl_acc;
-static int abl_cnt;
-static int abl_skip;
-
-static void abl_draw(int y)
-{
-    char buf[512];
-    int n = 0;
-
-    n += snprintf(buf + n, sizeof(buf) - n,
-                  "ABLASYON emu ms/frame (aktif: M%d)\n", g_exp_mode);
-    for (int m = 0; m < EXP_NMODES; m++) {
-        if (abl_valid[m]) {
-            n += snprintf(buf + n, sizeof(buf) - n, "M%d %-10s %lu.%lu\n",
-                          m, abl_name[m], abl_us[m] / 1000, (abl_us[m] / 100) % 10);
-        } else {
-            n += snprintf(buf + n, sizeof(buf) - n, "M%d %-10s --\n", m, abl_name[m]);
-        }
-    }
-    video_draw_debug_text(8, y, rgb(120, 255, 160), "%s", buf);
-}
-#endif
 
 /* ------------------------------------------------------------------ */
 /* Olcum penceresi: SADECE ROM yukluyken ve autorun aciksken sayilir.  */
 /* ------------------------------------------------------------------ */
-#if PROF_ACTIVE
 #define PROF_WIN 8        /* ortalama penceresi (emulasyon dongusu sayisi) */
 
 static uint64_t acc_emu, acc_aud, acc_draw, acc_hud, acc_wait, acc_wall, acc_in, acc_txt;
@@ -141,28 +45,30 @@ static unsigned long avg_nes_fps10;      /* NES fps * 10 */
 static int prof_n;
 static int prof_frame0;
 static int prof_have;                    /* en az bir pencere tamamlandi mi */
-#endif
 
 /* Son karede bos dongu atlamasiyla gecilen cycle (HUD: ff:). */
 static unsigned long ff_last_frame;
 
-#if PROF_ACTIVE
 static inline int  profile_start_if(void) { return profile_start(); }
 static inline void profile_end_into(int h, uint64_t *acc) { *acc += profile_end(h); }
-#else
-static inline int  profile_start_if(void) { return 0; }
-static inline void profile_end_into(int h, uint64_t *acc) { (void)h; (void)acc; }
-#endif
 
 /* Sesi hic calmadan at (turbo modunda ara framelerin sesi). */
-#if EXP_TURBO_FRAMES > 1
-static void discard_audio(void)
+
+/* Menuden ikinci (ve sonraki) ROM yuklemesi: acilistaki ile ayni "soguk baslangic" dizisi (onceki oyundan hicbir CPU/PPU/APU/mapper
+ * durumu kalmaz). Test: onceki oyundan sonra bu dizi, taze surecte yuklemeyle ayni durum hash'ini verir. */
+static int load_rom_cold(const char *fullpath)
 {
-    static int16_t trash[1024];
-    emu_driver_sync_apu();   /* tembel APU: bosaltmadan once guncelle */
-    while (apu_drain_samples(&bus.apu, trash, 1024) == 1024) { }
+    memset(&cpu, 0, sizeof cpu);
+    nes_input_init(&in);
+    ppu_init(&ppu);
+    ppu_clear_screen();
+    nes_bus_init(&bus, &ppu, &in);
+    emu_driver_init(&cpu, &ppu, &in, &bus);
+    memset(bus.mem, 0, 0x0800);
+    if (!nes_rom_load_mapper0(fullpath, bus.mem, &ppu)) return 0;
+    emu_driver_reset_from_vector();
+    return 1;
 }
-#endif
 
 int main(void)
 {
@@ -182,27 +88,23 @@ int main(void)
     int selected = 0;
     int rom_loaded = 0;
     int autorun = 0;
+    int loaded_once = 0;     /* ilk yukleme acilis durumundan; sonrakiler soguk baslangic */
+    uint64_t start_hold_us = 0;   /* Start'in basili kaldigi sure (us): menuye donus */
+    uint64_t last_loop_us = 0;    /* bir onceki dongu karesinin suresi (us) */
     int steps_per_frame = 29780;
 
-#if EXP_BENCH
-    bench_run();
-#endif
 
-#if EXP_NO_FILL
     /* video_display_on_vblank() arka tamponu arka plan rengiyle doldurur.
      * Bir kez cagirarak iki tamponu da dolu hale getir. */
     video_display_on_vblank();
-#endif
 
     while (1)
     {
         int p;
         uint64_t t_emu = 0, t_aud = 0, t_hud = 0, t_draw = 0, t_wait = 0, t_in = 0, t_txt = 0;
-#if PROF_ACTIVE
         const int frame_at_start = ppu.frame;
         const int loop_h = profile_start();
         int counted = 0;
-#endif
 
         p = profile_start_if();
 #if EXP_INPUT_PERIOD > 1
@@ -232,12 +134,18 @@ int main(void)
                         char fullpath[128];
                         snprintf(fullpath, sizeof(fullpath), "rom://%s", name);
 
-                        memset(bus.mem, 0, 0x0800);
-                        rom_loaded = nes_rom_load_mapper0(fullpath, bus.mem, &ppu);
+                        if (loaded_once) {
+                            rom_loaded = load_rom_cold(fullpath);
+                        } else {
+                            memset(bus.mem, 0, 0x0800);
+                            rom_loaded = nes_rom_load_mapper0(fullpath, bus.mem, &ppu);
+                            if (rom_loaded) emu_driver_reset_from_vector();
+                        }
 
                         if (rom_loaded) {
-                            emu_driver_reset_from_vector();
-                            autorun = 0;
+                            loaded_once = 1;
+                            autorun = EXP_AUTORUN_ON_LOAD;   /* secilen oyun B4'e basmadan calisir */
+                            start_hold_us = 0;
                             steps_per_frame = 29780;
                         }
                     }
@@ -247,9 +155,18 @@ int main(void)
         else
         {
             /* ---- Emulasyon ---- */
-#if EXP_ABLATE
-            const int mode_at_start = g_exp_mode;
-            unsigned long ps0[PS_N]; PS_SNAP(ps0);
+#if EXP_MENU_HOLD_MS > 0
+            /* START EXP_MENU_HOLD_MS milisaniye BASILI kalirsa ana menuye doner (uyari yok; tus onceden basili olsa da sayilir). */
+            if (in.buttons.player1.start) {
+                start_hold_us += last_loop_us;
+                if (start_hold_us >= (uint64_t)EXP_MENU_HOLD_MS * 1000ULL) {
+                    rom_loaded = 0;
+                    autorun = 0;
+                    start_hold_us = 0;
+                }
+            } else {
+                start_hold_us = 0;
+            }
 #endif
             const unsigned long ff0 = g_ff_cycles_total;
             p = profile_start_if();
@@ -267,7 +184,13 @@ int main(void)
             }
 
             if (autorun) {
+#if EXP_FRAME_SKIP > 0
+                /* KARE ATLAMA: dongu basina (1 + EXP_FRAME_SKIP) NES karesi; yalniz sonuncusu cizilir (oncekiler gizli kare). Ses hepsinin. */
+                for (int f = 0; f < 1 + EXP_FRAME_SKIP; f++) {
+                    ppu_set_render_skip(f < EXP_FRAME_SKIP);
+#else
                 for (int f = 0; f < EXP_TURBO_FRAMES; f++) {
+#endif
                     int cycles_in_frame = 0;
                     /* Bos dongu atlamasi (EXP_IDLE_FF) kare butcesini asmasin. */
                     emu_driver_ff_set_stop(cpu.emu.clockticks + steps_per_frame);
@@ -277,25 +200,13 @@ int main(void)
                         if (dc == 0) break;
                     }
                     emu_driver_ff_set_stop(0);
-#if EXP_TURBO_FRAMES > 1
-                    if (f < EXP_TURBO_FRAMES - 1) discard_audio();
-#endif
                 }
+#if EXP_FRAME_SKIP > 0
+                ppu_set_render_skip(0);   /* gizli kare modu dongu disina tasmasin (menu, duraklatma, reset) */
+#endif
             }
             profile_end_into(p, &t_emu);
             ff_last_frame = g_ff_cycles_total - ff0;
-#if EXP_ABLATE
-            if (autorun && (mode_at_start == 0 || mode_at_start == 4)) {
-                const int mi = (mode_at_start == 0) ? 0 : 1;
-                unsigned long ps1[PS_N]; PS_SNAP(ps1);
-                for (int q = 0; q < PS_N; q++) ps_acc[mi][q] += ps1[q] - ps0[q];
-                if (++ps_n[mi] >= 4) {
-                    for (int q = 0; q < PS_N; q++) ps_avg[mi][q] = ps_acc[mi][q] / (unsigned long)(ps_n[mi] * EXP_TURBO_FRAMES);
-                    for (int q = 0; q < PS_N; q++) ps_acc[mi][q] = 0;
-                    ps_n[mi] = 0;
-                }
-            }
-#endif
 
             /* ---- Ses ---- */
             p = profile_start_if();
@@ -311,25 +222,14 @@ int main(void)
             }
             profile_end_into(p, &t_aud);
 
-#if PROF_ACTIVE
             counted = autorun;
-#endif
         }
 
-#if !EXP_NO_FILL
-        video_fill_screen(rgb(30,30,40));
-#endif
 
         if (!rom_loaded) {
             rom_browser_draw(selected);
-#if EXP_BENCH
-            bench_draw(452);
-#endif
         } else {
             p = profile_start_if();
-#if EXP_HUD
-            debug_hud_draw(&cpu, autorun, steps_per_frame);
-#endif
             profile_end_into(p, &t_hud);
 
             emu_driver_sync_ppu();   /* tembel PPU: cizimden once guncelle */
@@ -339,48 +239,10 @@ int main(void)
             profile_end_into(p, &t_draw);
 
             p = profile_start_if();
-#if EXP_PROFILE
-            /* Olcum satirlari (hud/draw olcumlerinin disinda). */
-            video_draw_debug_text(
-                8, 24, rgb(255, 230, 80),
-                "emu:%lu aud:%lu draw:%lu hud:%lu wait:%lu in:%lu txt:%lu us%s\n"
-                "NES %lu.%lu fps  blit:%d nofill:%d turbo:%d  M%d  ff:%lu  ppu:%s",
-                avg_emu, avg_aud, avg_draw, avg_hud, avg_wait, avg_in, avg_txt,
-                prof_have ? "" : " (olculuyor)",
-                avg_nes_fps10 / 10, avg_nes_fps10 % 10,
-                ppu_blit_mode(), EXP_NO_FILL, EXP_TURBO_FRAMES,
-#if EXP_ABLATE
-                g_exp_mode,
-#else
-                0,
-#endif
-                ff_last_frame,
-                ppu_get_fast_sprites() ? "HIZLI" : "dogru"
-                );
-#endif
-#if EXP_ABLATE
-            abl_draw(292);
-#endif
-#if EXP_BENCH
-            bench_draw(392);
-#endif
-#if EXP_ABLATE
-            for (int mi = 0; mi < 2; mi++) {
-                const unsigned long *a_ = ps_avg[mi];
-                video_draw_debug_text(
-                    8, 404 + mi * 24, rgb(255, 170, 170),
-                    "M%d cagri:%lu dot:%lu slow:%lu bulk:%lu/%lu 3dot:%lu kucuk:%lu\n"
-                    " spr0:%lu bg:%lu dw:%lu | c0=%lu c1=%lu c23=%lu c252=%lu c336=%lu dgr=%lu vbl=%lu",
-                    mi ? 4 : 0, a_[0], a_[1], a_[4], a_[5], a_[6], a_[2], a_[3],
-                    a_[7], a_[8], a_[9],
-                    a_[10], a_[11], a_[12], a_[13], a_[14], a_[15], a_[16]);
-            }
-#endif
-#if EXP_FPS_HUD && !EXP_PROFILE
-            video_draw_debug_text(8, 24, rgb(255, 230, 80), "NES %lu.%lu fps  ff:%lu  ppu:%s",
-                                  avg_nes_fps10 / 10, avg_nes_fps10 % 10, ff_last_frame,
-                                  ppu_get_fast_sprites() ? "HIZLI" : "dogru");
-#endif
+            video_draw_debug_text(8, 24, rgb(255, 230, 80), "NES %lu.%lu fps  emu:%lu.%lums in:%lu.%lums  ff:%lu  ppu:%s",
+                                  avg_nes_fps10 / 10, avg_nes_fps10 % 10,
+                                  avg_emu / 1000, (avg_emu / 100) % 10, avg_in / 1000, (avg_in / 100) % 10,
+                                  ff_last_frame, ppu_get_fast_sprites() ? "HIZLI" : "dogru");
             profile_end_into(p, &t_txt);
         }
 
@@ -388,18 +250,14 @@ int main(void)
         video_display_on_vblank();
         profile_end_into(p, &t_wait);
 
-#if PROF_ACTIVE
         {
             const uint64_t loop_us = profile_end(loop_h);
+            last_loop_us = loop_us;
 
             if (!counted) {
                 /* Menu / duraklatma / ROM yukleme: pencereyi sifirla. */
                 prof_n = 0;
                 acc_emu = acc_aud = acc_draw = acc_hud = acc_wait = acc_wall = acc_in = acc_txt = 0;
-#if EXP_ABLATE
-                g_exp_mode = 0;
-                abl_acc = 0; abl_cnt = 0; abl_skip = 1;
-#endif
             } else {
                 if (prof_n == 0) prof_frame0 = frame_at_start;
                 acc_emu += t_emu; acc_aud += t_aud; acc_draw += t_draw;
@@ -427,24 +285,8 @@ int main(void)
                     acc_emu = acc_aud = acc_draw = acc_hud = acc_wait = acc_wall = acc_in = acc_txt = 0;
                 }
 
-#if EXP_ABLATE
-                if (abl_skip > 0) {
-                    abl_skip--;                 /* mod degisiminden sonraki ilk dongu atilir */
-                } else {
-                    abl_acc += t_emu;
-                    abl_cnt++;
-                    if (abl_cnt >= ABL_LOOPS) {
-                        abl_us[g_exp_mode] =
-                            (unsigned long)(abl_acc / abl_cnt / EXP_TURBO_FRAMES);
-                        abl_valid[g_exp_mode] = 1;
-                        abl_acc = 0; abl_cnt = 0; abl_skip = 1;
-                        g_exp_mode = (g_exp_mode + 1) % EXP_NMODES;
-                    }
-                }
-#endif
             }
         }
-#endif
     }
 
     return 0;

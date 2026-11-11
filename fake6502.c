@@ -5,6 +5,7 @@
 #include "cpu_fast.h"
 
 extern int g_nmi_ready;
+extern int g_ff_stop;
 extern int g_irq_pending;
 extern int g_nmi_pending;
 extern int g_irq_poll_snapshot;
@@ -2275,6 +2276,41 @@ void fake6502_step(fake6502_context *c)
 
     c->emu.instructions++;
 }
+
+/* ============================================================
+ * TAM-KOMUT HIZLI YOLU (fake6502_fast.inc, gen_fast.py ile uretilir)
+ * ============================================================ */
+
+/* Okuma: RAM / PRG / PRG-RAM; baska bir adres (PPU/APU/kartus yazmaci) -> komutu reddet (hicbir durum degismeden). */
+#define RD(dst, A) do { const uint16_t a_ = (uint16_t)(A); uint8_t r_;                                           \
+    if (__builtin_expect(a_ < 0x2000u, 1)) r_ = mem[a_ & 0x7FFu];                                               \
+    else if (__builtin_expect(a_ >= 0x8000u, 1)) r_ = mem[a_];                                                   \
+    else if (a_ >= 0x6000u) { r_ = mapper_prg_ram_enabled(bus) ? bus->cart_sram[a_ - 0x6000u] : lv; touched = 1; } \
+    else goto abort_i;                                                                                            \
+    lra = a_; lv = r_; ticks++; (dst) = r_; } while (0)
+/* Yalniz sinif denetimi (yan etkisiz): ileride okunacak adres hizli yolda mi? */
+#define CHKR(A) do { const uint16_t a_ = (uint16_t)(A); if (!(a_ < 0x2000u || a_ >= 0x6000u)) goto abort_i; } while (0)
+/* Yazma: RAM / PRG-RAM; PRG ($8000+) mapper'a gider, G/C yazmaclari yan etkilidir -> reddet. */
+#define WR(A, V) do { const uint16_t a_ = (uint16_t)(A); const uint8_t w_ = (uint8_t)(V);                         \
+    if (a_ < 0x2000u) mem[a_ & 0x7FFu] = w_;                                                                    \
+    else if (a_ >= 0x6000u && a_ < 0x8000u) { if (mapper_prg_ram_write_enabled(bus)) bus->cart_sram[a_ - 0x6000u] = w_; } \
+    else goto abort_i;                                                                                            \
+    lv = w_; ticks++; wrote = 1; } while (0)
+
+#define NZ(r_) (fl = (uint8_t)((fl & ~(FAKE6502_ZERO_FLAG | FAKE6502_SIGN_FLAG)) | (((uint8_t)(r_)) ? 0 : FAKE6502_ZERO_FLAG) | ((r_) & FAKE6502_SIGN_FLAG)))
+#define ADD8(b_) do { const uint16_t bb_ = (uint16_t)(b_); const uint16_t rr_ = (uint16_t)((uint16_t)a + bb_ + (fl & FAKE6502_CARRY_FLAG)); \
+    fl = (uint8_t)((fl & ~0xC3) | (((uint8_t)rr_) ? 0 : 2) | (((((uint16_t)rr_ ^ a) & ((uint16_t)rr_ ^ bb_)) & 0x80) ? 0x40 : 0) | (rr_ & 0x80) | ((rr_ & 0xFF00) ? 1 : 0)); \
+    a = (uint8_t)rr_; } while (0)
+#define CMPV(r_, v_) (fl = (uint8_t)((fl & ~0x83) | (((uint16_t)(r_) >= (uint16_t)(v_)) ? 1 : 0) | (((r_) == (v_)) ? 2 : 0) | (((uint16_t)((uint16_t)(r_) - (v_))) & 0x80)))
+
+#include "fake6502_fast.inc"
+
+#undef RD
+#undef CHKR
+#undef WR
+#undef NZ
+#undef ADD8
+#undef CMPV
 
 #ifdef FAKE6502_SELFTEST
 /* Bayrak tablosu opcode tablosuyla tutarli mi? 0 = tamam. */

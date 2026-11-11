@@ -120,6 +120,15 @@ void ppu_draw(const ppu_t *ppu);
 /* Hizli mod (EXP_FAST_PPU): sprite hatti satir basina tek seferde hesaplanir. Bit-exact degildir. */
 void ppu_set_fast_sprites(int on);
 int  ppu_get_fast_sprites(void);
+
+/* Kare atlama (EXP_FRAME_SKIP): 1 iken satir ciziciler piksel uretmez (gizli kare); CPU'nun gorebildigi durum degismez. */
+void ppu_set_render_skip(int on);
+int  ppu_get_render_skip(void);
+
+/* A/B karsilastirma (ab_core.h): ekranin bir satirinin hash'i ve ekranin kopyasi (256x240, RGB1555). */
+uint32_t ppu_screen_line_hash(int y);
+void ppu_copy_screen(uint16_t *dst);
+void ppu_clear_screen(void);   /* screen_buffer'i sifirla (A/B soguk baslangic icin) */
 uint8_t ppu_cpu_read(ppu_t *ppu, uint16_t addr);
 void ppu_cpu_write(ppu_t *ppu, uint16_t addr, uint8_t val);
 

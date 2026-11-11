@@ -12,6 +12,8 @@ void mapper_reset_state(void);
 /* MMC3 — PPU A12 rising edge. */
 void mapper_scanline_clock(void);
 int  mapper_irq_pending(void);
+/* IRQ'nun yukselebilecegi A12 saatinin sirasi (1 = siradaki); 0 = hicbir zaman. PPU olay mesafesi icin. */
+int  mapper_scanline_clocks_until_irq(void);
 
 /* MMC2 initial latch/register state. */
 void mapper_mmc2_setup(void);

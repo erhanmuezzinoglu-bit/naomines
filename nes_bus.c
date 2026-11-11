@@ -48,29 +48,14 @@ static void sync_ppu(
  * PPU/APU'ya GORUNEN her erisimden (yazmac okuma/yazma, DMC durum degisikligi) ONCE ilgili bilesen
  * o cycle'a kadar senkronlanir, DMA bitiminde (zorla last_*_sync_tick atamasindan once) ikisi de
  * tam senkronlanir. Tembel olmayan yapilandirmada eski cycle-basi senkron aynen kalir. */
-#if EXP_LAZY_PPU
 #define DMA_TICK_PPU() ((void)0)
-#else
-#define DMA_TICK_PPU() sync_ppu(bus, ctx)
-#endif
-#if EXP_LAZY_APU
 #define DMA_TICK_APU() ((void)0)
-#else
-#define DMA_TICK_APU() sync_apu(bus, ctx)
-#endif
 #define DMA_TICK() do { DMA_TICK_PPU(); DMA_TICK_APU(); emu_driver_dma_cycle_events(); } while (0)
 
-#if EXP_LAZY_PPU || EXP_LAZY_APU
 #define DMA_SYNC_ALL()      do { sync_ppu(bus, ctx); sync_apu(bus, ctx); } while (0)
 #define DMA_SYNC_PPU()      sync_ppu(bus, ctx)
 #define DMA_SYNC_APU()      sync_apu(bus, ctx)
 #define DMA_SYNC_ACCESS(a)  do { if ((a) >= 0x2000u && (a) < 0x8000u) DMA_SYNC_ALL(); } while (0)
-#else
-#define DMA_SYNC_ALL()      ((void)0)
-#define DMA_SYNC_PPU()      ((void)0)
-#define DMA_SYNC_APU()      ((void)0)
-#define DMA_SYNC_ACCESS(a)  ((void)0)
-#endif
 
 void nes_bus_init(
     nes_bus_t *bus,
@@ -496,19 +481,13 @@ uint8_t nes_bus_read(
     fake6502_context *ctx,
     uint16_t addr)
 {
-#if EXP_LAZY_APU
     if (addr >= 0x4000 && addr <= 0x401F) {
         sync_apu(bus, ctx);
     }
-#else
-    sync_apu(bus, ctx);
-#endif
-#if EXP_LAZY_PPU
     /* PPU yazmaclari ve kartus yazmac alani: erisimden once PPU'yu guncelle. */
     if ((addr >= 0x2000 && addr <= 0x3FFF) || (addr >= 0x4020 && addr < 0x6000)) {
         sync_ppu(bus, ctx);
     }
-#endif
     bus->last_cpu_read_addr = addr;
 
     if (addr != 0x4016) {
@@ -550,19 +529,13 @@ void nes_bus_write(
     uint8_t value)
 {
     nes_io_break_4016_read_sequence(bus->in);
-#if EXP_LAZY_APU
     if (addr >= 0x4000 && addr <= 0x401F) {
         sync_apu(bus, ctx);
     }
-#else
-    sync_apu(bus, ctx);
-#endif
-#if EXP_LAZY_PPU
     /* PPU yazmaclari ve TUM kartus yazmaclari (CHR bank degisimi PPU'yu etkiler). */
     if (addr >= 0x2000 && (addr <= 0x3FFF || addr >= 0x4020)) {
         sync_ppu(bus, ctx);
     }
-#endif
     bus->open_bus_value = value;
     bus->cpu_internal_bus_value = value;
 

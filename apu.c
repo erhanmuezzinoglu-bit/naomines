@@ -903,7 +903,16 @@ int apu_cycles_to_next_event(const apu_t *apu)
 {
     if (!apu_quiescent(apu)) return 1;
 
+    /* DMC: CPU'ya gorunen etki (DMA istegi / IRQ) YALNIZ bit_count'u 0'a indiren zamanlayici yeniden yuklemesinde
+     * olusur (dmc_clock_timer). Diger yeniden yuklemeler yalnizca cikis seviyesini, kaydiriciyi ve sayaclari
+     * degistirir (CPU gormez; $4010 yazimi senkrondan sonra okunur) ve apu_step icinde sirayla islenir. Bu yuzden olay
+     * mesafesi, siradaki "bayt sonu" yeniden yuklemesine kadardir:
+     *   (timer + 1) + (bit_count - 1) * (timer_period + 1)
+     * (eskiden her yeniden yukleme olay sayiliyordu: en hizli oranda karede ~550 zorunlu senkron). */
     uint32_t e = (uint32_t)apu->dmc.timer + 1u;
+    if (apu->dmc.bit_count > 1u) {
+        e += ((uint32_t)apu->dmc.bit_count - 1u) * ((uint32_t)apu->dmc.timer_period + 1u);
+    }
     uint32_t f = apu_frame_event_distance(apu);
     if (f < e) e = f;
     return (int)e;
@@ -911,10 +920,6 @@ int apu_cycles_to_next_event(const apu_t *apu)
 
 void apu_step(apu_t *apu, int cpu_cycles)
 {
-#if EXP_ABLATE
-    /* M1/M4 (SADECE OLCUM): APU adimi kapali. */
-    if (EXP_APU_OFF) return;
-#endif
     int remaining = cpu_cycles;
 
     while (remaining > 0) {

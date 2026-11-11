@@ -69,12 +69,17 @@ void nes_bus_write(
  * Yazma: $0000-$1FFF. nes_bus_write yalnizca pad1_last_bus_was_4016=0, open_bus_value,
  *   cpu_internal_bus_value ve bus->mem yazimi yapar.
  * Donus: 1 = kisa devre uygulandi, 0 = uygulanmadi (normal nes_bus_read/write cagrilmali). */
+/* mapper.c (PRG-RAM acik/yazma serbest): nes_bus.h mapper.h'yi dahil edemez (dongusel), burada bildirilir. */
+int mapper_prg_ram_enabled(const nes_bus_t *bus);
+int mapper_prg_ram_write_enabled(const nes_bus_t *bus);
+
 static inline int nes_bus_fast_read(nes_bus_t *b, uint16_t addr, uint8_t *out)
 {
     uint8_t v;
 
     if (addr < 0x2000)       v = b->mem[addr & 0x07FF];
     else if (addr >= 0x8000) v = b->mem[addr];
+    else if (addr >= 0x6000) v = mapper_prg_ram_enabled(b) ? b->cart_sram[addr - 0x6000] : b->open_bus_value;   /* PRG-RAM */
     else                     return 0;
 
     b->last_cpu_read_addr = addr;
@@ -87,7 +92,18 @@ static inline int nes_bus_fast_read(nes_bus_t *b, uint16_t addr, uint8_t *out)
 
 static inline int nes_bus_fast_write(nes_bus_t *b, uint16_t addr, uint8_t v)
 {
-    if (addr >= 0x2000) return 0;
+    if (addr >= 0x2000) {
+        /* PRG-RAM ($6000-$7FFF): mapper'a gitmez, yalniz cart_sram'e yazilir; PPU'yu senkronlamak gerekmez
+         * (nes_bus_write bu alan icin de senkronluyordu: gereksiz, PPU durumu zamanin saf fonksiyonu). */
+        if (addr >= 0x6000 && addr < 0x8000) {
+            if (b->in) b->in->pad1_last_bus_was_4016 = 0;
+            b->open_bus_value = v;
+            b->cpu_internal_bus_value = v;
+            if (mapper_prg_ram_write_enabled(b)) b->cart_sram[addr - 0x6000] = v;
+            return 1;
+        }
+        return 0;
+    }
 
     if (b->in) b->in->pad1_last_bus_was_4016 = 0;
     b->open_bus_value = v;

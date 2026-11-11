@@ -5,6 +5,10 @@
 
 /* MMC3 IRQ state. */
 static int mmc3_irq_pending = 0;
+/* MMC3 bank esleme degisiklik izleme (bkz. mmc3_update). */
+static uint8_t mmc3_ap_regs[8];
+static uint8_t mmc3_ap_mode;
+static uint8_t mmc3_ap_valid;
 
 /* MMC2 bus pointer. mapper_map_prg_pages() bunu bus init'te doldurur. */
 static nes_bus_t *g_mapper_bus = NULL;
@@ -42,9 +46,13 @@ static uint8_t a53_chr = 0;      /* register $00 */
 /* ============================================================
  *  Mapper state reset
  * ============================================================ */
+static void mapper_tags_clear(void);
+
 void mapper_reset_state(void)
 {
     memset(&g_mapper, 0, sizeof(g_mapper));
+    mapper_tags_clear();
+    mmc3_ap_valid = 0;   /* bir sonraki MMC3 guncellemesi tam olsun */
 
     /* MMC1 power-on/reset defaults. */
     g_mapper.mmc1_shift = 0x10;
@@ -103,6 +111,21 @@ void mapper_scanline_clock(void)
     }
 }
 
+/* Siradaki A12 saatlerinden kacincisinde IRQ sinyali (CPU'ya gorunen) YUKSELEBILIR? 1 = siradaki saat; 0 = hicbir zaman
+ * (mapper 4 degil veya IRQ kapali: saatler yalniz sayaci degistirir, CPU gormez; $C000/$C001/$E000/$E001 yazimlari
+ * senkrondan sonra islenir). mmc3_clock_irq ile ayni mantik: sayac 0 veya reload ise saatte latch'e yuklenir,
+ * degilse azalir; sayac 0 olunca IRQ. */
+int mapper_scanline_clocks_until_irq(void)
+{
+    if (nes_last_mapper_loaded != 4) return 0;
+    if (!g_mapper.mmc3_irq_enable) return 0;
+
+    if (g_mapper.mmc3_irq_counter == 0 || g_mapper.mmc3_irq_reload) {
+        return (g_mapper.mmc3_irq_latch == 0) ? 1 : 1 + (int)g_mapper.mmc3_irq_latch;
+    }
+    return (int)g_mapper.mmc3_irq_counter;
+}
+
 int mapper_irq_pending(void)
 {
     if (nes_last_mapper_loaded == 4) {
@@ -114,9 +137,27 @@ int mapper_irq_pending(void)
 /* ============================================================
  *  Ortak yardımcılar
  * ============================================================ */
+/* Pencere etiketleri: her PRG 8 KB penceresinde ($8000,$A000,$C000,$E000) ve her CHR 1 KB yuvasinda (0..7) su anda hangi
+ * KAYNAK bankin kopyalanmis oldugunu tutar; ayni kaynak yeniden istenirse kopyalama atlanir (icerik zaten ayni).
+ * Bu pencereleri YALNIZ asagidaki yardimcilar degistirir. Etiketler mapper_reset_state() ve mapper_map_prg_pages()
+ * basinda silinir (ROM yukleme, ppu_init). CHR yalniz CHR-ROM'da etiketlenir (CHR-RAM'e PPU yazabilir). */
+static const uint8_t *g_prg_tag[4];
+static const uint8_t *g_chr_tag[8];
+
+static void mapper_tags_clear(void)
+{
+    for (int i = 0; i < 4; i++) g_prg_tag[i] = 0;
+    for (int i = 0; i < 8; i++) g_chr_tag[i] = 0;
+}
+
 static void set_prg_8k(nes_bus_t *bus, uint32_t addr, uint8_t *src)
 {
     if (!src) return;
+    if (addr >= 0x8000u && addr <= 0xE000u && (addr & 0x1FFFu) == 0) {
+        const uint32_t w = (addr - 0x8000u) >> 13;
+        if (g_prg_tag[w] == src) return;
+        g_prg_tag[w] = src;
+    }
     memcpy(&bus->mem[addr], src, 8192);
 }
 
@@ -125,14 +166,22 @@ static void set_prg_16k(nes_bus_t *bus, uint32_t addr, int bank16k)
     int b8 = bank16k * 2;
     if (b8 < 0 || b8 + 1 >= nes_prg_banks_count) return;
 
-    memcpy(&bus->mem[addr],       nes_prg_banks[b8],     8192);
-    memcpy(&bus->mem[addr + 8192], nes_prg_banks[b8 + 1], 8192);
+    set_prg_8k(bus, addr,        nes_prg_banks[b8]);
+    set_prg_8k(bus, addr + 8192, nes_prg_banks[b8 + 1]);
 }
 
 static void set_chr_1k(nes_bus_t *bus, int slot, int bank_1k)
 {
     if (bank_1k < 0 || bank_1k >= nes_chr_banks_count) return;
     if (!bus->ppu || !nes_chr_banks[bank_1k]) return;
+    if (slot >= 0 && slot < 8) {
+        if (nes_chr_is_rom) {
+            if (g_chr_tag[slot] == nes_chr_banks[bank_1k]) return;
+            g_chr_tag[slot] = nes_chr_banks[bank_1k];
+        } else {
+            g_chr_tag[slot] = 0;
+        }
+    }
     memcpy(&bus->ppu->vram[slot * 1024], nes_chr_banks[bank_1k], 1024);
 }
 
@@ -587,10 +636,66 @@ static void mmc3_update_mirroring(nes_bus_t *bus)
     bus->ppu->mirroring = g_mapper.mmc3_mirroring ? 0 : 1;
 }
 
+/* Degisiklik izleme: son UYGULANAN bank yazmaclari ve mod bitleri. Eskiden her mapper yazmasi ($8000/$8001 dahil, hatta
+ * IRQ/aynalama yazmaclari) 4x8 KB PRG + 8x1 KB CHR'yi bastan kopyaliyordu (~40 KB). Esleme yalnizca (regs[], select & 0xC0,
+ * toplam bank sayilari) ile belirlendigi icin, degisen pencereler yeniden kopyalanir; sonuc birebir aynidir.
+ * mmc3_ap_valid = 0 (ROM yukleme / mapper_reset_state) -> bir sonraki guncelleme tamdir. */
+static int mmc3_chr_bank(int slot)
+{
+    const int total_1k = nes_chr_banks_count;
+    const uint8_t *r = g_mapper.mmc3_regs;
+    int s = slot;
+    if (g_mapper.mmc3_select & 0x80) s = (slot + 4) & 7;   /* CHR ters cevrim: pencere cifti degisir */
+    if (s < 4) {
+        const int b = (r[s >> 1] & 0xFE) % total_1k;       /* R0 (slot 0,1), R1 (slot 2,3): 2 KB */
+        return (s & 1) ? (b + 1) % total_1k : b;
+    }
+    return r[s - 2] % total_1k;                            /* R2..R5 (slot 4..7) */
+}
+
+static void mmc3_apply_chr_slot(nes_bus_t *bus, int slot)
+{
+    set_chr_1k(bus, slot, mmc3_chr_bank(slot));
+}
+
+static void mmc3_apply_prg_window(nes_bus_t *bus, int win)   /* 0: $8000, 1: $A000, 2: $C000, 3: $E000 */
+{
+    const int total_8k = nes_prg_banks_count;
+    const int r6 = g_mapper.mmc3_regs[6] % total_8k;
+    const int r7 = g_mapper.mmc3_regs[7] % total_8k;
+    int b[4] = { r6, r7, (total_8k >= 2) ? total_8k - 2 : 0, (total_8k >= 1) ? total_8k - 1 : 0 };
+    if (g_mapper.mmc3_select & 0x40) { const int t = b[0]; b[0] = b[2]; b[2] = t; }
+    set_prg_8k(bus, 0x8000 + win * 0x2000, nes_prg_banks[b[win]]);
+}
+
 static void mmc3_update(nes_bus_t *bus)
 {
-    mmc3_update_prg(bus);
-    mmc3_update_chr(bus);
+    const uint8_t mode = (uint8_t)(g_mapper.mmc3_select & 0xC0);
+
+    if (!mmc3_ap_valid || mode != mmc3_ap_mode) {
+        mmc3_update_prg(bus);
+        mmc3_update_chr(bus);
+    } else {
+        const uint8_t *r = g_mapper.mmc3_regs;
+        const int chr_ok = bus->ppu && nes_chr_is_rom && nes_chr_banks_count > 0;
+        const int prg_ok = nes_prg_banks_count > 0;
+        const int inv = (mode & 0x80) != 0;
+        const int swp = (mode & 0x40) != 0;
+        for (int i = 0; i < 8; i++) {
+            if (r[i] == mmc3_ap_regs[i]) continue;
+            if (i < 2) {
+                if (chr_ok) { const int s0 = (inv ? 4 : 0) + i * 2; mmc3_apply_chr_slot(bus, s0); mmc3_apply_chr_slot(bus, s0 + 1); }
+            } else if (i < 6) {
+                if (chr_ok) mmc3_apply_chr_slot(bus, (inv ? 0 : 4) + (i - 2));
+            } else if (prg_ok) {
+                mmc3_apply_prg_window(bus, i == 6 ? (swp ? 2 : 0) : 1);
+            }
+        }
+    }
+
+    memcpy(mmc3_ap_regs, g_mapper.mmc3_regs, 8);
+    mmc3_ap_mode = mode;
+    mmc3_ap_valid = 1;
     mmc3_update_mirroring(bus);
 }
 
@@ -832,6 +937,7 @@ static void m180_update(nes_bus_t *bus)
 void mapper_map_prg_pages(nes_bus_t *bus)
 {
     if (!bus) return;
+    mapper_tags_clear();   /* tam yeniden esleme: etiketler gecersiz */
 
     /* MMC2 PPU latch handler icin bus pointer'ini sakla. */
     g_mapper_bus = bus;

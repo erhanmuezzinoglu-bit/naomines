@@ -23,7 +23,7 @@ static void sync_apu(
     int elapsed = current_ticks - bus->last_apu_sync_tick;
 
     if (elapsed > 0) {
-        apu_step(&bus->apu, elapsed);
+        APU_STEP(&bus->apu, elapsed);
         bus->last_apu_sync_tick = current_ticks;
     }
 }
@@ -114,7 +114,7 @@ static uint8_t nes_bus_read_raw(
         }
     }
     else if (addr >= 0x8000) {
-        data = bus->mem[addr];
+        data = NES_PRG_READ(bus, addr);
     }
 
     bus->open_bus_value = data;
@@ -488,6 +488,10 @@ uint8_t nes_bus_read(
     if ((addr >= 0x2000 && addr <= 0x3FFF) || (addr >= 0x4020 && addr < 0x6000)) {
         sync_ppu(bus, ctx);
     }
+    /* SNROM: PRG-RAM etkinligi PPU'nun erisim anindaki konumundan hesaplanir. */
+    if (g_prgram_ppu_dep && addr >= 0x6000 && addr < 0x8000) {
+        sync_ppu(bus, ctx);
+    }
     bus->last_cpu_read_addr = addr;
 
     if (addr != 0x4016) {
@@ -528,6 +532,8 @@ void nes_bus_write(
     uint16_t addr,
     uint8_t value)
 {
+    /* SNROM: PRG-RAM yazma etkinligi PPU'nun erisim anindaki konumundan hesaplanir. */
+    if (g_prgram_ppu_dep && addr >= 0x6000 && addr < 0x8000) sync_ppu(bus, ctx);
     nes_io_break_4016_read_sequence(bus->in);
     if (addr >= 0x4000 && addr <= 0x401F) {
         sync_apu(bus, ctx);

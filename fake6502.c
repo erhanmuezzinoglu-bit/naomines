@@ -2170,9 +2170,16 @@ void fake6502_irq(fake6502_context *c)
     }
 }
 
+#if EXP_BENCH && EXP_BENCH_PC
+uint32_t g_pch[65536];   /* komut adresi histogrami (bench tanisi) */
+int g_pch_on;
+#endif
 void fake6502_step(fake6502_context *c)
 {
     s_unstable_store_dma_halt = 0;
+#if EXP_BENCH && EXP_BENCH_PC
+    if (g_pch_on) g_pch[c->cpu.pc]++;
+#endif
 
     const uint8_t old_i =
         c->cpu.flags &
@@ -2284,18 +2291,46 @@ void fake6502_step(fake6502_context *c)
 /* Okuma: RAM / PRG / PRG-RAM; baska bir adres (PPU/APU/kartus yazmaci) -> komutu reddet (hicbir durum degismeden). */
 #define RD(dst, A) do { const uint16_t a_ = (uint16_t)(A); uint8_t r_;                                           \
     if (__builtin_expect(a_ < 0x2000u, 1)) r_ = mem[a_ & 0x7FFu];                                               \
-    else if (__builtin_expect(a_ >= 0x8000u, 1)) r_ = mem[a_];                                                   \
-    else if (a_ >= 0x6000u) { r_ = mapper_prg_ram_enabled(bus) ? bus->cart_sram[a_ - 0x6000u] : lv; touched = 1; } \
+    else if (__builtin_expect(a_ >= 0x8000u, 1)) r_ = FAST_PRG(a_);                                                   \
+    else if (a_ >= 0x6000u) { if (g_prgram_ppu_dep) goto abort_i; r_ = mapper_prg_ram_enabled(bus) ? bus->cart_sram[a_ - 0x6000u] : lv; touched = 1; wn++; } \
     else goto abort_i;                                                                                            \
     lra = a_; lv = r_; ticks++; (dst) = r_; } while (0)
-/* Yalniz sinif denetimi (yan etkisiz): ileride okunacak adres hizli yolda mi? */
-#define CHKR(A) do { const uint16_t a_ = (uint16_t)(A); if (!(a_ < 0x2000u || a_ >= 0x6000u)) goto abort_i; } while (0)
-/* Yazma: RAM / PRG-RAM; PRG ($8000+) mapper'a gider, G/C yazmaclari yan etkilidir -> reddet. */
-#define WR(A, V) do { const uint16_t a_ = (uint16_t)(A); const uint8_t w_ = (uint8_t)(V);                         \
-    if (a_ < 0x2000u) mem[a_ & 0x7FFu] = w_;                                                                    \
-    else if (a_ >= 0x6000u && a_ < 0x8000u) { if (mapper_prg_ram_write_enabled(bus)) bus->cart_sram[a_ - 0x6000u] = w_; } \
+/* Program (pc) okumasi: RD ile ayni esleme ve yan etkiler, yalniz denetim sirasi farkli (kod neredeyse hep PRG'de). */
+#define RDP(dst, A) do { const uint16_t a_ = (uint16_t)(A); uint8_t r_;                                          \
+    if (__builtin_expect(a_ >= 0x8000u, 1)) r_ = FAST_PRG(a_);                                                       \
+    else if (a_ < 0x2000u) r_ = mem[a_ & 0x7FFu];                                                               \
+    else if (a_ >= 0x6000u) { if (g_prgram_ppu_dep) goto abort_i; r_ = mapper_prg_ram_enabled(bus) ? bus->cart_sram[a_ - 0x6000u] : lv; touched = 1; wn++; } \
     else goto abort_i;                                                                                            \
-    lv = w_; ticks++; wrote = 1; } while (0)
+    lra = a_; lv = r_; ticks++; (dst) = r_; } while (0)
+/* PRG ($8000+) okumasi: EXP_PRG_PTR'de goruntu (yerel pimg kopyasi, mem[] ile ayni indeksleme), aksi halde mem[]. */
+#if EXP_PRG_PTR
+#define FAST_PRG(a) (pimg[(a)])
+#else
+#define FAST_PRG(a) (mem[(a)])
+#endif
+/* Salt okuma isleminin son okumasi (ardindan bus erisimi yok, komut reddedilemez): RD ile ayni, ek olarak $2002 PPU durumu
+ * surucude yavas yolun aynisiyla okunur (emu_driver_fast_status_read: okuma anina PPU senkronu + ppu_cpu_read). Okuma aninin
+ * cycle'i clk + ticks + 1 (yavas yolda clockticks++ sonrasi deger). */
+#define RDV(dst, A) do { const uint16_t a_ = (uint16_t)(A); uint8_t r_;                                          \
+    if (__builtin_expect(a_ < 0x2000u, 1)) r_ = mem[a_ & 0x7FFu];                                               \
+    else if (__builtin_expect(a_ >= 0x8000u, 1)) r_ = FAST_PRG(a_);                                                   \
+    else if (a_ >= 0x6000u) { if (g_prgram_ppu_dep) goto abort_i; r_ = mapper_prg_ram_enabled(bus) ? bus->cart_sram[a_ - 0x6000u] : lv; touched = 1; wn++; } \
+    else if ((a_ & 0xE007u) == 0x2002u && emu_driver_fast_status_read(clk + ticks + 1, ipc, &r_)) pr_ = 1;     \
+    else goto abort_i;                                                                                            \
+    lra = a_; lv = r_; ticks++; (dst) = r_; } while (0)
+/* Yazilabilirlik denetimi (yan etkisiz): WR ile ayni sinif kosulu. RMW komutlari yazmaclari degistirmeden once kullanir. */
+#define CHKW(A) do { const uint16_t a_ = (uint16_t)(A); if (!(a_ < 0x2000u || (a_ >= 0x6000u && a_ < 0x8000u && !g_prgram_ppu_dep))) goto abort_i; } while (0)
+/* Yalniz sinif denetimi (yan etkisiz): ileride okunacak adres hizli yolda mi? */
+#define CHKR(A) do { const uint16_t a_ = (uint16_t)(A); if (!(a_ < 0x2000u || a_ >= 0x8000u || (a_ >= 0x6000u && !g_prgram_ppu_dep))) goto abort_i; } while (0)
+/* Yazma: RAM / PRG-RAM; PRG ($8000+) mapper'a gider, G/C yazmaclari yan etkilidir -> reddet. */
+/* Ayni degeri yazan ("sessiz") dahili RAM yazimi bellegi degistirmez ve yan etkisi yoktur: bos dongu tespitinde (g_write_epoch,
+ * wn) yazma sayilmaz. Boylece ornegin her turda bir RAM baytini sabit noktasina yazan bekleme donguleri (rastgele sayi
+ * karistirma) da bos dongu olarak atlanabilir. Diger tum etkiler (bellek, lv, cycle) aynidir. */
+#define WR(A, V) do { const uint16_t a_ = (uint16_t)(A); const uint8_t w_ = (uint8_t)(V);                         \
+    if (a_ < 0x2000u) { uint8_t *const m_ = &mem[a_ & 0x7FFu]; if (*m_ != w_) { *m_ = w_; wrote = 1; wn++; } }   \
+    else if (a_ >= 0x6000u && a_ < 0x8000u && !g_prgram_ppu_dep) { if (mapper_prg_ram_write_enabled(bus)) bus->cart_sram[a_ - 0x6000u] = w_; wrote = 1; wn++; } \
+    else goto abort_i;                                                                                            \
+    lv = w_; ticks++; } while (0)
 
 #define NZ(r_) (fl = (uint8_t)((fl & ~(FAKE6502_ZERO_FLAG | FAKE6502_SIGN_FLAG)) | (((uint8_t)(r_)) ? 0 : FAKE6502_ZERO_FLAG) | ((r_) & FAKE6502_SIGN_FLAG)))
 #define ADD8(b_) do { const uint16_t bb_ = (uint16_t)(b_); const uint16_t rr_ = (uint16_t)((uint16_t)a + bb_ + (fl & FAKE6502_CARRY_FLAG)); \
@@ -2303,9 +2338,22 @@ void fake6502_step(fake6502_context *c)
     a = (uint8_t)rr_; } while (0)
 #define CMPV(r_, v_) (fl = (uint8_t)((fl & ~0x83) | (((uint16_t)(r_) >= (uint16_t)(v_)) ? 1 : 0) | (((r_) == (v_)) ? 2 : 0) | (((uint16_t)((uint16_t)(r_) - (v_))) & 0x80)))
 
+/* emu_driver.c: onceki step_1 yavas komut (fake6502_step) calistirdiysa 1 (hizli yol ilk geri dallanmada surucuye doner). */
+extern int g_rf_after_slow;
+/* emu_driver.c: hizli yol cagrisi sonunda reddedilen komutu fake6502_step ile calistirdiysa 1 yapar (surucu sifirlar). */
+extern int g_rf_slow_done;
+/* emu_driver.c: hizli $2002 okumasi (bkz. RDV) ve onceki cagrinin yoklama donusu bayragi. */
+int emu_driver_fast_status_read(int tick, uint16_t ipc, uint8_t *out);
+extern int g_rf_poll_ret;
+extern unsigned long g_ff_cycles_total;   /* emu_driver.c: atlanan cycle istatistigi */
+
 #include "fake6502_fast.inc"
 
 #undef RD
+#undef RDP
+#undef RDV
+#undef FAST_PRG
+#undef CHKW
 #undef CHKR
 #undef WR
 #undef NZ

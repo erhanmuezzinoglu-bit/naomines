@@ -54,8 +54,15 @@ int apu_irq_line(const apu_t *apu)
     return 0;
 }
 
+#if EXP_DIAG_PROF
+int g_apu_shadow_active = 0;   /* olcum kipi: golge APU'nun IRQ hatti gercek CPU'ya yansimaz */
+#endif
+
 static void apu_update_irq_line(apu_t *apu)
 {
+#if EXP_DIAG_PROF
+    if (g_apu_shadow_active) return;
+#endif
     if (apu_irq_line(apu)) {
         emu_driver_request_irq();
     } else {
@@ -849,16 +856,39 @@ static inline uint32_t timer_bulk(uint16_t *timer, uint16_t period, uint32_t m)
     }
     m -= (uint32_t)*timer + 1u;
     const uint32_t p1 = (uint32_t)period + 1u;
+    /* SH-4'te degiskenle bolme yazilim yordami (pahali); ornek araligi (~40 cycle) icinde reload sayisi kucuktur:
+     * kucuk bolumler (en kisa gurultu periyodunda ornek basina ~10 reload dahil) cikarma ile (sonuc birebir ayni). */
+    if (m < p1) {
+        *timer = (uint16_t)(period - m);
+        return 1u;
+    }
+    if (m < 16u * p1) {
+        uint32_t r = 1u;
+        do { m -= p1; r++; } while (m >= p1);
+        *timer = (uint16_t)(period - m);
+        return r;
+    }
     *timer = (uint16_t)(period - (m % p1));
     return 1u + m / p1;
+}
+
+/* dmc_clock_timer'in timer == 0 ve bit_count >= 2 dalinin bit/cikis kismi (bayt sonu degil); timer'i ve bayragi
+ * toplu ilerletme (timer_bulk) zaten yeniden yuklemistir. */
+static inline void dmc_simple_reload(dmc_t *d)
+{
+    if (d->shift_register & 1) {
+        if (d->value <= 125) d->value += 2;
+    } else {
+        if (d->value >= 2) d->value -= 2;
+    }
+    d->shift_register >>= 1;
+    d->bit_count--;
 }
 
 static void apu_bulk_advance(apu_t *apu, uint32_t s)
 {
     const uint64_t t0 = apu->total_cycles;
     const uint32_t evens = (uint32_t)(((t0 + s) >> 1) - (t0 >> 1));
-
-    apu->dmc.timer_reloaded_this_cycle = 0;
 
     /* pulse: yalniz cift cycle'larda */
     {
@@ -881,16 +911,36 @@ static void apu_bulk_advance(apu_t *apu, uint32_t s)
     {
         noise_t *n = &apu->noise;
         uint32_t r = timer_bulk(&n->timer, n->timer_period, s);
-        const uint8_t shift_amt = n->mode ? 6 : 1;
-        while (r--) {
-            uint16_t feedback = (n->shift_register & 1) ^ ((n->shift_register >> shift_amt) & 1);
-            n->shift_register >>= 1;
-            n->shift_register |= (uint16_t)(feedback << 14);
+        /* LFSR'yi r adim birden ilerlet (tek adimlik dongunun birebir sonucu). Yazmac 15 bittir (baslangic 1, tek
+         * degistiren adim bit 14'e yazar). Bit i = x[n+i] dizisiyle: tek adim x[n+15] = x[n] ^ x[n+a] (a = 1 ya da 6).
+         * k adimda yeni bitler x[n+15+j] = x[n+j] ^ x[n+j+a] (j < k), j + a <= 14 oldugu surece hepsi eski durumdan gelir:
+         * k <= 15 - a (mod 0: 14, mod 1: 9). Daha uzun r parcalara bolunur. */
+        if (r) {
+            const unsigned a = n->mode ? 6u : 1u;
+            const unsigned kmax = 15u - a;
+            unsigned sr = n->shift_register;
+            while (r) {
+                const unsigned k = r < kmax ? r : kmax;
+                const unsigned nb = (sr ^ (sr >> a)) & ((1u << k) - 1u);
+                sr = (sr >> k) | (nb << (15u - k));
+                r -= k;
+            }
+            n->shift_register = (uint16_t)sr;
         }
     }
 
-    /* DMC sayaci: bu aralikta reload yok (s <= timer) */
-    apu->dmc.timer = (uint16_t)(apu->dmc.timer - s);
+    /* DMC: cagiran araligi siradaki BAYT SONU yeniden yuklemesinden once bitirir; aradaki yeniden yuklemeler (bit_count
+     * >= 2) yalniz cikis/kaydirici/sayaci degistirir (dmc_simple_reload). Ornek araligi (<= 41 cycle) en kisa DMC
+     * periyodundan (54) kisa oldugu icin adim basina en fazla 1 yeniden yukleme olur (genel sayi da dogru islenir).
+     * Yeniden yukleme adimin son cycle'indaysa bayrak 1 (yuklemeden sonra timer = period; n > 0 iken timer == period
+     * yalniz son cycle yuklemeyse). Ornek, adimin son cycle'indan SONRA karistirildigi icin DMC guncellemesini gorur
+     * (apu_cycle sirasi: dmc_clock_timer, sonra ornek). */
+    {
+        dmc_t *const d = &apu->dmc;
+        uint32_t dn = timer_bulk(&d->timer, d->timer_period, s);
+        d->timer_reloaded_this_cycle = (dn != 0u && d->timer == d->timer_period);
+        while (dn) { dmc_simple_reload(d); dn--; }
+    }
 
     apu->frame_seq_count += s;
     apu->total_cycles = t0 + s;
@@ -901,7 +951,19 @@ static void apu_bulk_advance(apu_t *apu, uint32_t s)
  * DMC sayac reload'i (DMA istegi/IRQ olusturabilir) ve frame-sequencer olaylari (IRQ). */
 int apu_cycles_to_next_event(const apu_t *apu)
 {
-    if (!apu_quiescent(apu)) return 1;
+    if (!apu_quiescent(apu)) {
+        /* $4015 okumasi pending_irq_clear kurar (siradaki cift cycle'da frame IRQ bayragi temizlenir). Bayrak zaten 0 ise
+         * bu temizleme CPU'ya gorunmez (IRQ hatti degismez). Bayragi bu arada 1 yapabilecek tek sey frame-sequencer IRQ
+         * olayidir (asagida olay mesafesine zaten dahil) ya da pending_frame_irq_reassert (sessiz degil -> 1). Diger
+         * bekleyenler yoksa siradaki gorunur olay, sessiz durumdaki gibi hesaplanir; aradaki cycle'lari apu_step birebir
+         * isler (temizleme kendi cift cycle'inda yapilir). Ses surucusunun $4015'i sik okudugu oyunlarda (karede yuzlerce)
+         * okuma basina 1-2 zorunlu APU senkronu kalkar. */
+        const int only_clear = apu->pending_irq_clear && !apu->frame_counter_irq &&
+            !(apu->pending_frame_irq_reassert | apu->pending_length_clock |
+              apu->dmc.implicit_stop_delay | apu->dmc.disable_delay | apu->dmc.enable_delay | apu->dmc.loop_implicit_delay |
+              (apu->reset_delay != 0));
+        if (!only_clear) return 1;
+    }
 
     /* DMC: CPU'ya gorunen etki (DMA istegi / IRQ) YALNIZ bit_count'u 0'a indiren zamanlayici yeniden yuklemesinde
      * olusur (dmc_clock_timer). Diger yeniden yuklemeler yalnizca cikis seviyesini, kaydiriciyi ve sayaclari
@@ -909,13 +971,40 @@ int apu_cycles_to_next_event(const apu_t *apu)
      * mesafesi, siradaki "bayt sonu" yeniden yuklemesine kadardir:
      *   (timer + 1) + (bit_count - 1) * (timer_period + 1)
      * (eskiden her yeniden yukleme olay sayiliyordu: en hizli oranda karede ~550 zorunlu senkron). */
-    uint32_t e = (uint32_t)apu->dmc.timer + 1u;
-    if (apu->dmc.bit_count > 1u) {
-        e += ((uint32_t)apu->dmc.bit_count - 1u) * ((uint32_t)apu->dmc.timer_period + 1u);
+    const dmc_t *const d = &apu->dmc;
+    uint32_t e = (uint32_t)d->timer + 1u;
+    if (d->bit_count > 1u) {
+        e += ((uint32_t)d->bit_count - 1u) * ((uint32_t)d->timer_period + 1u);
+    }
+    /* DMC bosta (okunacak bayt yok, DMA istegi/iptal yok): bayt sonu yeniden yuklemesi CPU'ya gorunmez. dmc_clock_timer'a gore
+     * bayt sonunda yalniz iki gorunur etki var: (1) tampon doluyken current_length > 0 ya da iptal bekliyorsa yeni DMA istegi,
+     * (2) tampon bosken (current_length == 0, etkin, iptal yok, dongu yok, irq_enable) DMC IRQ bayragi. (1) burada imkansiz;
+     * (2) bayrak zaten kuruluysa degisiklik yapmaz. Bu alanlari degistirebilen tek sey CPU yazimi ($4010/$4015, zorunlu senkron)
+     * ve DMA'dir (burada yok); tampon doluysa ilk bayt sonu onu bosaltir, IRQ en erken ikinci bayt sonundadir. Boylece hizli DMC
+     * oraninda ama sessizken (bayt basina bir zorunlu senkron) olay sayisi duser. */
+    if (!d->dma_request && d->current_length == 0 && !d->implicit_abort_pending && !d->implicit_abort_active) {
+        const int irq_possible = d->enabled && !d->loop && d->irq_enable && !d->irq_pending;
+        if (!irq_possible) e = 0x00FFFFFFu;
+        else if (d->buffer_full) e += 8u * ((uint32_t)d->timer_period + 1u);
     }
     uint32_t f = apu_frame_event_distance(apu);
     if (f < e) e = f;
+    if (e > 0x00FFFFFFu) e = 0x00FFFFFFu;
     return (int)e;
+}
+
+static inline void apu_emit_sample(apu_t *apu)
+{
+    apu->sample_accumulator -= APU_CPU_CLOCK_HZ;
+    if (apu->sample_count < 8192) {
+        apu->sample_buffer[apu->sample_count++] = apu_mix(
+            pulse_output(&apu->p1, 1),
+            pulse_output(&apu->p2, 0),
+            triangle_output(&apu->tri),
+            noise_output(&apu->noise),
+            apu->dmc.value
+        );
+    }
 }
 
 void apu_step(apu_t *apu, int cpu_cycles)
@@ -923,22 +1012,53 @@ void apu_step(apu_t *apu, int cpu_cycles)
     int remaining = cpu_cycles;
 
     while (remaining > 0) {
+        /* $4015 okumasindan kalan, CPU'ya gorunmez frame IRQ temizlemesi (bayrak zaten 0, baska bekleyen yok): apu_cycle
+         * bunu siradaki cift cycle'da (ce = 1 ya da 2) yapar: frame_counter_irq = 0 (zaten 0) ve IRQ hattini yeniden
+         * hesaplar (bayraklar degismedigi icin degismez: g_irq_pending her zaman APU/mapper kaynaklarinin VEYA'sidir).
+         * O cycle'dan once bayragi 1 yapabilecek bir frame olayi yoksa (olay ce'de ise once temizleme, sonra olay calisir:
+         * temizlemeyi atlamakla ayni) ve adim ce'yi kapsiyorsa, bekleyen bayrak simdi dusurulur; aradaki cycle'lar sessiz
+         * yoldan (toplu) islenir. Boylece okuma basina 1-2 apu_cycle ve aralik bolunmesi kalkar. */
+        if (apu->pending_irq_clear && !apu->frame_counter_irq &&
+            !(apu->pending_frame_irq_reassert | apu->pending_length_clock |
+              apu->dmc.implicit_stop_delay | apu->dmc.disable_delay | apu->dmc.enable_delay | apu->dmc.loop_implicit_delay |
+              (apu->reset_delay != 0))) {
+            const uint32_t ce = ((apu->total_cycles + 1u) & 1u) ? 2u : 1u;
+            if (ce <= (uint32_t)remaining && ce <= apu_frame_event_distance(apu)) apu->pending_irq_clear = 0;
+        }
         if (remaining > 1 && apu_quiescent(apu)) {
-            /* ilk olay cycle'inin indeksi (1 tabanli): DMC reload, frame olayi, ornek uretimi */
-            uint32_t j = (uint32_t)apu->dmc.timer + 1u;
-            uint32_t f = apu_frame_event_distance(apu);
-            if (f < j) j = f;
-            uint32_t smp = (APU_CPU_CLOCK_HZ - apu->sample_accumulator + APU_OUTPUT_HZ - 1u) / APU_OUTPUT_HZ;
-            if (smp < j) j = smp;
+            /* Sessiz durumda olay cycle'lari: frame-sequencer olaylari ve DMC yeniden yuklemeleri. Olay icermeyen bastaki
+             * cycle'lar (span) toplu ilerletilir; aradaki ornekler araligin icinde uretilir (apu_cycle ile ayni sira:
+             * ornek o cycle'in zamanlayici guncellemelerinden SONRA karistirilir).
+             * DMC bosta (kaydirici 0, cikis < 2, bit_count >= 1): bayt sonu olmayan yeniden yuklemeler cikisi degistirmez
+             * (0 biti: value >= 2 degil -> ayni; kaydirici 0 kalir); yalniz timer/bit_count/bayrak degisir. Bu yuzden
+             * span siradaki BAYT SONU yeniden yuklemesine kadar uzar ve DMC sayaci span sonunda tek seferde ilerletilir.
+             * DMC bosta degilse span siradaki yeniden yuklemeden once biter (eski davranis). */
+            /* Sessiz durumda olay cycle'lari: frame-sequencer olaylari ve DMC'nin BAYT SONU yeniden yuklemesi (DMA istegi /
+             * IRQ / kaydirici yuklemesi). Aradaki DMC yeniden yuklemeleri (bit_count >= 2) toplu ilerletmenin icinde
+             * islenir (apu_bulk_advance). Olay icermeyen bastaki cycle'lar (span) toplu ilerletilir; aradaki ornekler
+             * araligin icinde uretilir (apu_cycle ile ayni sira: ornek o cycle'in guncellemelerinden SONRA). */
+            const dmc_t *const dm = &apu->dmc;
+            uint32_t ev = (uint32_t)dm->timer + 1u;                     /* DMC yeniden yukleme cycle'i (1 tabanli) */
+            if (dm->bit_count >= 2u) ev += ((uint32_t)dm->bit_count - 1u) * ((uint32_t)dm->timer_period + 1u);
+            const uint32_t f = apu_frame_event_distance(apu);
+            if (f < ev) ev = f;
 
-            uint32_t skip = j - 1u;                    /* olay icermeyen bastaki cycle sayisi */
-            if (skip > (uint32_t)remaining) skip = (uint32_t)remaining;
-            if (skip > 0u) {
-                apu_bulk_advance(apu, skip);
-                remaining -= (int)skip;
+            uint32_t span = ev - 1u;                    /* olay icermeyen bastaki cycle sayisi */
+            if (span > (uint32_t)remaining) span = (uint32_t)remaining;
+            remaining -= (int)span;
+            while (span > 0u) {
+                /* siradaki ornegi ureten cycle'in indeksi (1 tabanli; sabite bolme: carpmaya donusur) */
+                const uint32_t smp = (APU_CPU_CLOCK_HZ - apu->sample_accumulator + APU_OUTPUT_HZ - 1u) / APU_OUTPUT_HZ;
+                if (smp > span) {
+                    apu_bulk_advance(apu, span);
+                    break;
+                }
+                apu_bulk_advance(apu, smp);            /* ornek cycle'i dahil */
+                apu_emit_sample(apu);
+                span -= smp;
             }
             if (remaining > 0) {
-                apu_cycle(apu);
+                apu_cycle(apu);                        /* olay cycle'i ya da kalan son cycle */
                 remaining--;
             }
         } else {

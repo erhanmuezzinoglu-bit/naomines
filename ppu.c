@@ -13,6 +13,8 @@
  */
 
 #include "ppu.h"
+/* OAM icerik surumu (bkz. sprite_line_masks). */
+static unsigned g_oam_ver = 1;
 #include "nes_rom.h"
 #include "exp_config.h"
 
@@ -47,13 +49,28 @@
 
 #define PS_STAT(x) ((void)0)
 #include <naomi/video.h>
+#include <naomi/system.h>   /* hw_memcpy (store queue) */
 #include <string.h>
 #include <stdbool.h>
 
 /* Mapper kancaları (mapper.c). */
 extern void mapper_scanline_clock(void);
 extern int mapper_scanline_clocks_until_irq(void);
+#if EXP_DIAG_PROF
+int g_ppu_shadow_active = 0;   /* olcum kipi: golge PPU adimlanirken mapper saati ve ekran yazimi bastirilir */
+/* olcum kipi ablasyonu (yalniz golge PPU'da): 1 = sprite degerlendirme (fast_sprite_line) atlanir, 2 = satir cizimi (render_scanline) atlanir.
+ * Golge kopya atilir; fark, o isin maliyetini olcer. */
+int g_ppu_shadow_ablate = 0;
+#define SHADOW_ABLATE(k) (g_ppu_shadow_active && g_ppu_shadow_ablate == (k))
+#define MAPPER_CLOCK() do { if (!g_ppu_shadow_active) mapper_scanline_clock(); } while (0)
+#define PPU_DW_DRAW (!g_ppu_shadow_active)
+#define PPU_SHADOW g_ppu_shadow_active
+#else
 #define MAPPER_CLOCK() mapper_scanline_clock()
+#define PPU_DW_DRAW 1
+#define PPU_SHADOW 0
+#define SHADOW_ABLATE(k) 0
+#endif
 
 /* ============================================================
  *  Sanal dot
@@ -192,8 +209,10 @@ static inline scr_pixel_t nes_color_to_1555(uint8_t nes_color) {
 /* video_init()'ten SONRA cagrilmali. Donanim piksel formatini makroya bakmadan,
  * ayni rengi video_draw_pixel ile cizip ham 16 biti geri okuyarak turetir ve
  * framebuffer'in satir-major yerlesimini kucuk bir testle dogrular. */
+static int s_bgpc_ok;   /* arka plan palet onbellegi gecerli mi (bkz. bg_pal_cache) */
 static void ppu_blit_init(void)
 {
+    s_bgpc_ok = 0;
     for (int i = 0; i < 64; i++) s_pal16[i] = rgb555_fallback(nes_palette_rgb[i]);
     s_blit_mode = 2;
 
@@ -502,7 +521,12 @@ void ppu_clear_screen(void) { memset(screen_buffer, 0, sizeof(screen_buffer)); }
  * EXP_FRAME_SKIP > 0 iken main.c, gorunmeyecek karelerde ppu_set_render_skip(1) cagirir: satir ciziciler PIKSEL URETMEZ.
  * CPU'nun gorebildigi hicbir sey degismez: sprite-0 carpisma bayragi (reg_status bit 6) ve sprite kaydirici (sps) durumu
  * normal cizimdeki gibi korunur; yalnizca screen_buffer icerigi (gorunmeyen kare) farklidir. */
-#if EXP_FRAME_SKIP
+/* TANI (davranisi degistirmez): gizli karede piksel uretimi atlanan satir sayisi, nokta-nokta (render_line_dotwise) cizilen
+ * satir sayisi; ppu_built_frame_skip = bu dosyanin derlendigi EXP_FRAME_SKIP degeri (main.c ile uyusmazsa eski .o kalmis demektir). */
+unsigned long g_ppu_diag_hidden_lines = 0, g_ppu_diag_dotwise_lines = 0;
+const int ppu_built_frame_skip = EXP_FRAME_SKIP;
+
+#if EXP_FRAME_SKIP || EXP_DIAG_PROF
 static int g_ppu_render_skip = 0;
 void ppu_set_render_skip(int on) { g_ppu_render_skip = on ? 1 : 0; }
 int  ppu_get_render_skip(void)   { return g_ppu_render_skip; }
@@ -520,18 +544,45 @@ int  ppu_get_fast_sprites(void)   { return g_ppu_fast_sprites; }
 /* Cycle 257'de cagrilir (render acik, sl < 240 veya sl == 261). Normal pipeline'in o satir icin uretecegi sonucu
  * tek seferde uretir: OAM'den ilk 8 sprite (OAM sirasiyla), ikincil OAM'e kopya (attr 0xE3 maskeli), spr0_sec,
  * eval_found; sonra her slot icin sprite_load_slot (ayni desen yukleme). 9. sprite varsa tasma bayragi hemen. */
+/* Satir basina sprite maskesi onbellegi: m[sl] bit i = OAM sprite i, satir sl'yi kapsar ((unsigned)(sl - y) < height).
+ * OAM yazildiginda (g_oam_ver: $2004 yazimi, OAM bozulmasi, ppu_init, ppu_oam_changed) ya da sprite yuksekligi degistiginde
+ * yeniden kurulur (kare basina en fazla 64 x 16 is; eskiden her satirda 64 karsilastirma). Iki giris: gercek ve golge PPU. */
+static struct { const ppu_t *p; unsigned ver; int h; uint64_t m[240]; } g_slc[2];
+static int g_slc_next;
+void ppu_oam_changed(void) { g_oam_ver++; }
+static const uint64_t *sprite_line_masks(const ppu_t *ppu, int height)
+{
+    int e;
+    for (e = 0; e < 2; e++)
+        if (g_slc[e].p == ppu && g_slc[e].ver == g_oam_ver && g_slc[e].h == height) return g_slc[e].m;
+    for (e = 0; e < 2 && g_slc[e].p != ppu; e++) {}
+    if (e == 2) { e = g_slc_next; g_slc_next ^= 1; }
+    g_slc[e].p = ppu; g_slc[e].ver = g_oam_ver; g_slc[e].h = height;
+    uint64_t *const m = g_slc[e].m;
+    memset(m, 0, sizeof g_slc[e].m);
+    for (int i = 0; i < 64; i++) {
+        const int y = ppu->oam[4 * i];
+        const uint64_t bit = (uint64_t)1 << i;
+        for (int r = 0; r < height; r++) { const int l = y + r; if (l >= 240) break; m[l] |= bit; }
+    }
+    return m;
+}
+
 static void fast_sprite_line(ppu_t *ppu, int sl)
 {
+    if (SHADOW_ABLATE(1)) return;
     if (sl < 240) {
         const int height = (ppu->reg_ctrl & 0x20) ? 16 : 8;
         const uint8_t *const o = ppu->oam;
         uint8_t *const sec = ppu->sec_oam;
         int found = 0;
-        memset(sec, 0xFF, 32);
         ppu->spr0_sec = 0;
-        for (int i = 0; i < 64; i++) {
+        uint64_t mk = sprite_line_masks(ppu, height)[sl];
+        while (mk) {
+            const int i = __builtin_ctzll(mk);
+            mk &= mk - 1;
             const uint8_t y = o[4 * i];
-            if ((unsigned)(sl - (int)y) < (unsigned)height) {
+            {
                 if (found < 8) {
                     sec[4 * found + 0] = y;
                     sec[4 * found + 1] = o[4 * i + 1];
@@ -546,11 +597,31 @@ static void fast_sprite_line(ppu_t *ppu, int sl)
             }
         }
         ppu->eval_found = (uint8_t)found;
-    }
-    for (int k = 0; k < 8; k++) {
-        const uint8_t *const b = &ppu->sec_oam[4 * k];
-        ppu->fetch_byte[0] = b[0]; ppu->fetch_byte[1] = b[1]; ppu->fetch_byte[2] = b[2]; ppu->fetch_byte[3] = b[3];
-        sprite_load_slot(ppu, sl, k);
+        /* Bulunan girislerin altindaki sec_oam zaten yazildi; yalniz kalanini 0xFF yap (sonuc eski tam memset ile ayni). */
+        if (found < 8) memset(sec + 4 * found, 0xFF, (size_t)(32 - 4 * found));
+        /* Dolu slotlar: genel yol. */
+        for (int k = 0; k < found; k++) {
+            const uint8_t *const b = &sec[4 * k];
+            ppu->fetch_byte[0] = b[0]; ppu->fetch_byte[1] = b[1]; ppu->fetch_byte[2] = b[2]; ppu->fetch_byte[3] = b[3];
+            sprite_load_slot(ppu, sl, k);
+        }
+        /* Bos slotlar (bayt 0xFF x4, sl < 240): sprite_load_slot'un gecersiz dali birebir:
+         * rel = sl - 255 < 0 => gecersiz; spr0_line = 0 (k==0); spr_x/attr/lo/hi dokunulmaz. */
+        if (found < 8) {
+            for (int k = found; k < 8; k++) {
+                ppu->spr_valid[k] = 0;
+                ppu->sps.lo[k] = 0; ppu->sps.hi[k] = 0;
+                ppu->sps.attr[k] = 0xFF; ppu->sps.cnt[k] = 0xFF;
+            }
+            if (found == 0) ppu->spr0_line = 0;
+            ppu->fetch_byte[0] = ppu->fetch_byte[1] = ppu->fetch_byte[2] = ppu->fetch_byte[3] = 0xFF;
+        }
+    } else {
+        for (int k = 0; k < 8; k++) {
+            const uint8_t *const b = &ppu->sec_oam[4 * k];
+            ppu->fetch_byte[0] = b[0]; ppu->fetch_byte[1] = b[1]; ppu->fetch_byte[2] = b[2]; ppu->fetch_byte[3] = b[3];
+            sprite_load_slot(ppu, sl, k);
+        }
     }
     ppu->oam_addr = 0;
     ppu->oam2_addr = 0;
@@ -613,6 +684,7 @@ static void oam_corrupt_apply(ppu_t *ppu)
     if (row) {
         memcpy(&ppu->oam[row * 8], &ppu->oam[0], 8);
         ppu->sec_oam[row] = ppu->sec_oam[0];
+        g_oam_ver++;
     }
 }
 #endif
@@ -1205,16 +1277,19 @@ static void ppu_2007_buffer_from_bus(ppu_t *ppu)
 
 static void sps_end_of_fast_line(ppu_t *ppu)
 {
+    /* lo|hi == 0 olan slotta (bos slotlarin cogu) kaydirma sonucu zaten 0: yalniz cnt/halted yazilir. */
     for (int k = 0; k < 8; k++) {
-        int s = 256 - (int)ppu->sps.cnt[k];
-        if (s >= 8) { ppu->sps.lo[k] = 0; ppu->sps.hi[k] = 0; }
-        else if (s > 0) {
-            ppu->sps.lo[k] = (uint8_t)(ppu->sps.lo[k] << s);
-            ppu->sps.hi[k] = (uint8_t)(ppu->sps.hi[k] << s);
+        if (ppu->sps.lo[k] | ppu->sps.hi[k]) {
+            int s = 256 - (int)ppu->sps.cnt[k];
+            if (s >= 8) { ppu->sps.lo[k] = 0; ppu->sps.hi[k] = 0; }
+            else if (s > 0) {
+                ppu->sps.lo[k] = (uint8_t)(ppu->sps.lo[k] << s);
+                ppu->sps.hi[k] = (uint8_t)(ppu->sps.hi[k] << s);
+            }
         }
-        ppu->sps.cnt[k] = 0;
-        ppu->sps.halted[k] = 1;
     }
+    memset(ppu->sps.cnt, 0, 8);
+    memset(ppu->sps.halted, 1, 8);
 }
 
 /* ============================================================
@@ -1223,20 +1298,48 @@ static void sps_end_of_fast_line(ppu_t *ppu)
  *  Farklar (sonuc ayni): yansitma tablosu (ppu_core_vram_mask switch'i yerine), yerel palet
  *  tablosu, kenar disi karolarda sinir kontrolsuz 8 piksel, bg_pixels istege bagli (NULL olabilir).
  * ============================================================ */
-/* spread[b]: b'nin bit (7-k)'si, 4*k. bitine tasinir (piksel k = soldan k. piksel). */
-static uint32_t s_spread[256];
+/* spread2[b]: b'nin bit (7-k)'si, 2*k. bitine tasinir (piksel k = soldan k. piksel; 2 bit/piksel). */
+static uint16_t s_spread2[256];
+/* s_bgb4[x]: x'in dort 2 bitlik alani (piksel j = (x >> 2j) & 3) -> bellekte 4 bayt { c0, c1, c2, c3 } (bg_pixels icin). */
+static uint32_t s_bgb4[256];
 static void bg_spread_init(void)
 {
     for (unsigned b = 0; b < 256; b++) {
-        uint32_t w = 0;
-        for (unsigned k = 0; k < 8; k++) w |= (uint32_t)((b >> (7 - k)) & 1u) << (4 * k);
-        s_spread[b] = w;
+        unsigned w = 0;
+        for (unsigned k = 0; k < 8; k++) w |= ((b >> (7 - k)) & 1u) << (2 * k);
+        s_spread2[b] = (uint16_t)w;
+        const uint8_t four[4] = { (uint8_t)(b & 3u), (uint8_t)((b >> 2) & 3u), (uint8_t)((b >> 4) & 3u), (uint8_t)((b >> 6) & 3u) };
+        memcpy(&s_bgb4[b], four, 4);
     }
 }
 
-static inline __attribute__((always_inline))
-void bg_line_fast_impl(ppu_t *ppu, uint8_t *restrict bg_pixels, const int has_bg)
+/* Arka plan palet onbellegi (palette_ram[0..15] icerigine anahtarli; s_pal16 degisirse ppu_blit_init gecersiz kilar):
+ *   s_bgpc[i]        = pal16[i] (eski satir basi tablosuyla ayni: i&3 == 0 -> evrensel arka plan rengi)
+ *   s_bgpp[p][q]     = iki piksellik 32 bitlik desen: q = c0 | c1 << 2 (c0 soldaki piksel), bellekteki sirasiyla
+ *                      { renk(p,c0), renk(p,c1) } (memcpy ile kuruldugu icin endian'dan bagimsiz). */
+static scr_pixel_t s_bgpc[16];
+static uint32_t s_bgpp[4][16];
+static uint8_t s_bgpc_key[16];
+typedef uint32_t ppu_u32a __attribute__((may_alias));
+static void bg_pal_cache(const ppu_t *ppu)
 {
+    if (s_bgpc_ok && memcmp(s_bgpc_key, ppu->palette_ram, 16) == 0) return;
+    memcpy(s_bgpc_key, ppu->palette_ram, 16);
+    for (int i = 0; i < 16; i++)
+        s_bgpc[i] = nes_color_to_1555(ppu->palette_ram[(i & 3) ? i : 0]);
+    for (int p = 0; p < 4; p++)
+        for (int q = 0; q < 16; q++) {
+            const scr_pixel_t two[2] = { s_bgpc[(q & 3) ? (p * 4 + (q & 3)) : 0], s_bgpc[(q >> 2) ? (p * 4 + (q >> 2)) : 0] };
+            memcpy(&s_bgpp[p][q], two, 4);
+        }
+    s_bgpc_ok = 1;
+}
+
+static inline __attribute__((always_inline))
+int bg_line_fast_impl(ppu_t *ppu, uint8_t *restrict bgbuf, const int has_bg)
+{
+    /* bgbuf (has_bg): karo hizali tampon, en az 264 bayt, 4'e hizali: bgbuf[tile*8 + k] = karo tile'in k. pikselinin kodu
+     * (ekran pikseli x = bgbuf[x + fine_x]). Donus: fine_x (cagiran bg_pixels = bgbuf + fine_x kullanir). */
     scr_pixel_t *restrict dst = &screen_buffer[ppu->scanline * 256];
 
     uint16_t v       = ppu->line_latched ? ppu->line_v : ppu->v;
@@ -1244,15 +1347,16 @@ void bg_line_fast_impl(ppu_t *ppu, uint8_t *restrict bg_pixels, const int has_bg
     const uint16_t bg_base = (ppu->line_latched ? ppu->line_bg_hi : ((ppu->reg_ctrl & 0x10) != 0))
                              ? 0x1000 : 0x0000;
 
-    scr_pixel_t pal16[16];
-    for (int i = 0; i < 16; i++)
-        pal16[i] = nes_color_to_1555(ppu->palette_ram[(i & 3) ? i : 0]);
+    bg_pal_cache(ppu);
+    const scr_pixel_t *const pal16 = s_bgpc;
 
     uint16_t nt_base[4];
     for (int i = 0; i < 4; i++)
         nt_base[i] = (uint16_t)(ppu_core_vram_mask((uint16_t)(0x2000 + (i << 10)), ppu->mirroring) & 0x0C00);
 
     const uint8_t *restrict vram = ppu->vram;
+    /* fine_x cift ise ic karolarin hedefi 4 bayta hizali (screen_buffer 32'ye hizali, satir 512 bayt): 2 piksellik yazim. */
+    const int even = !(fine_x & 1);
 
     for (int tile = 0; tile < 33; tile++) {
         const uint16_t nt_addr = 0x2000 | (v & 0x0FFF);
@@ -1263,42 +1367,49 @@ void bg_line_fast_impl(ppu_t *ppu, uint8_t *restrict bg_pixels, const int has_bg
 
         const uint16_t at_addr = 0x23C0 | (v & 0x0C00) | ((v >> 4) & 0x38) | ((v >> 2) & 0x07);
         const uint8_t attr = vram[0x2000 | nt_base[(at_addr >> 10) & 3] | (at_addr & 0x03FF)];
-        const unsigned hi4 = (unsigned)((attr >> (((v >> 4) & 4) | (v & 2))) & 0x03) << 2;
+        const unsigned pal = (unsigned)(attr >> (((v >> 4) & 4) | (v & 2))) & 0x03;
 
         const unsigned p0 = vram[p_addr];
         const unsigned p1 = vram[(uint16_t)(p_addr + 8)];
-        const uint32_t w = s_spread[p0] | (s_spread[p1] << 1);
-
-        /* c==0 -> pal16[0]; c!=0 -> pal16[hi4|c] */
-        const scr_pixel_t pal4[4] = { pal16[0], pal16[hi4 | 1], pal16[hi4 | 2], pal16[hi4 | 3] };
+        const unsigned w = (unsigned)s_spread2[p0] | ((unsigned)s_spread2[p1] << 1);   /* piksel k: (w >> 2k) & 3 */
 
         const int px0 = tile * 8 - (int)fine_x;
+        const uint32_t *const pp = s_bgpp[pal];
         if (tile != 0 && tile != 32) {
             scr_pixel_t *restrict d = dst + px0;
-#define BGPX(K) do { \
-                const unsigned c = (unsigned)(w >> (4 * (K))) & 3u; \
-                d[(K)] = pal4[c]; \
-                if (has_bg) bg_pixels[px0 + (K)] = (uint8_t)c; \
-            } while (0)
-            BGPX(0); BGPX(1); BGPX(2); BGPX(3); BGPX(4); BGPX(5); BGPX(6); BGPX(7);
-#undef BGPX
+            if (even) {
+                ppu_u32a *const d32 = (ppu_u32a *)(void *)d;
+                d32[0] = pp[w & 15u]; d32[1] = pp[(w >> 4) & 15u]; d32[2] = pp[(w >> 8) & 15u]; d32[3] = pp[(w >> 12) & 15u];
+            } else {
+                /* px0 tek: d+1 4'e hizali. Piksel 0 ve 7 tekil, (1,2) (3,4) (5,6) cift yazim. */
+                const unsigned c0 = w & 3u, c7 = (w >> 14) & 3u;
+                d[0] = pal16[c0 ? ((pal << 2) | c0) : 0];
+                ppu_u32a *const d32 = (ppu_u32a *)(void *)(d + 1);
+                d32[0] = pp[(w >> 2) & 15u]; d32[1] = pp[(w >> 6) & 15u]; d32[2] = pp[(w >> 10) & 15u];
+                d[7] = pal16[c7 ? ((pal << 2) | c7) : 0];
+            }
         } else {
+            const unsigned hi4 = pal << 2;
             for (int dot = 0; dot < 8; dot++) {
                 const int px = px0 + dot;
                 if (px < 0 || px >= 256) continue;
-                const unsigned c = (unsigned)(w >> (4 * dot)) & 3u;
-                dst[px] = pal4[c];
-                if (has_bg) bg_pixels[px] = (uint8_t)c;
+                const unsigned c = (w >> (2 * dot)) & 3u;
+                dst[px] = pal16[c ? (hi4 | c) : 0];
             }
+        }
+        if (has_bg) {
+            ppu_u32a *const b32 = (ppu_u32a *)(void *)(bgbuf + tile * 8);
+            b32[0] = s_bgb4[w & 0xFFu]; b32[1] = s_bgb4[(w >> 8) & 0xFFu];
         }
         v_inc_coarse_x(&v);
     }
+    return fine_x;
 }
 
-static void render_bg_line_fast(ppu_t *ppu, uint8_t *restrict bg_pixels)
+static int render_bg_line_fast(ppu_t *ppu, uint8_t *restrict bgbuf)
 {
-    if (bg_pixels) bg_line_fast_impl(ppu, bg_pixels, 1);
-    else           bg_line_fast_impl(ppu, NULL, 0);
+    if (bgbuf) return bg_line_fast_impl(ppu, bgbuf, 1);
+    else       return bg_line_fast_impl(ppu, NULL, 0);
 }
 
 /* ============================================================
@@ -1331,10 +1442,12 @@ static inline bool spr0_line_hit(const ppu_t *ppu, const uint8_t *bg_pixels, boo
 
 static void render_scanline(ppu_t *ppu) {
     if (ppu->scanline >= 240) return;
+    if (SHADOW_ABLATE(2)) return;
 
     ppu->line_rendered = 1;
     if (PPU_DOTWISE_ALWAYS || ppu->rt_count || ppu->bgs_start_valid || ppu->sps_irregular) {
-        render_line_dotwise(ppu, 1, NULL);
+        g_ppu_diag_dotwise_lines++;
+        render_line_dotwise(ppu, PPU_DW_DRAW, NULL);
         {
             uint8_t prev = ppu->rt_mask0;
             for (int i = 0; i < ppu->rt_count; i++) {
@@ -1346,13 +1459,16 @@ static void render_scanline(ppu_t *ppu) {
         return;
     }
 
-#if EXP_FRAME_SKIP
+#if EXP_FRAME_SKIP || EXP_DIAG_PROF
     if (g_ppu_render_skip) {
+        g_ppu_diag_hidden_lines++;
         /* GIZLI KARE: piksel yok. Yalnizca sprite 0 carpismasi hesaplanir (normal yolun k == 0 mantigi AYNEN). */
         if ((ppu->reg_mask & 0x18) == 0x18 && ppu->spr_valid[0] && ppu->spr0_line) {
-            uint8_t bgp[256];
-            if (ppu->bg_ev_count == 0) render_bg_line_fast(ppu, bgp);
-            else render_bg_row(ppu, bgp, 0, 0);
+            uint8_t bgbuf[264] __attribute__((aligned(4)));
+            const uint8_t *bgp = bgbuf;
+            /* render_bg_line_fast satiri ekrana da yazar; golge PPU (olcum kipi) ortak ekrana yazmamali: ozgun yol, draw=0 */
+            if (ppu->bg_ev_count == 0 && !PPU_SHADOW) bgp = bgbuf + render_bg_line_fast(ppu, bgbuf);
+            else render_bg_row(ppu, bgbuf, 0, 0);
 
             const bool lclip = !(ppu->reg_mask & 0x02) || !(ppu->reg_mask & 0x04);
             if (spr0_line_hit(ppu, bgp, lclip)) ppu->reg_status |= 0x40;
@@ -1362,7 +1478,8 @@ static void render_scanline(ppu_t *ppu) {
     }
 #endif
 
-    uint8_t bg_pixels[256];
+    uint8_t bgbuf[264] __attribute__((aligned(4)));
+    const uint8_t *bg_pixels = bgbuf;
 
     /* Sprite'lar kapaliysa veya satirda gecerli sprite yoksa bg_pixels/covered gerekmez. */
     int any_valid = 0;
@@ -1371,16 +1488,16 @@ static void render_scanline(ppu_t *ppu) {
     }
 
     if ((ppu->reg_mask & 0x08) && ppu->bg_ev_count == 0) {
-        render_bg_line_fast(ppu, any_valid ? bg_pixels : NULL);
+        bg_pixels = bgbuf + render_bg_line_fast(ppu, any_valid ? bgbuf : NULL);
     } else {
-        render_bg_row(ppu, bg_pixels, 1, 0);
+        render_bg_row(ppu, bgbuf, 1, 0);
     }
 
     if (!(ppu->reg_mask & 0x10)) { sps_end_of_fast_line(ppu); return; }
     if (!any_valid) { sps_end_of_fast_line(ppu); return; }
 
-    uint8_t covered[256];
-    memset(covered, 0, sizeof(covered));
+    /* covered: 256 bitlik dolu-piksel haritasi (eski uint8_t covered[256] ile ayni anlam; 32 bayt temizlenir). */
+    uint32_t covered[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 
     bool both_on = (ppu->reg_mask & 0x18) == 0x18;
     bool left_clip = !(ppu->reg_mask & 0x02) || !(ppu->reg_mask & 0x04);
@@ -1390,28 +1507,32 @@ static void render_scanline(ppu_t *ppu) {
     for (int k = 0; k < 8; k++) {
         if (!ppu->spr_valid[k]) continue;
 
-        uint8_t attr = ppu->spr_attr[k];
+        const uint8_t attr = ppu->spr_attr[k];
+        /* Piksel px -> bit (7 - px) olacak sekilde yonlendir (yansitmada ters cevir). */
         uint8_t p0 = ppu->spr_lo[k];
         uint8_t p1 = ppu->spr_hi[k];
-        int sx = ppu->spr_x[k];
-        bool flip_x = (attr & 0x40) != 0;
-        bool bg_priority = (attr & 0x20) != 0;
+        if (attr & 0x40) { p0 = rev8(p0); p1 = rev8(p1); }
+        unsigned op = (unsigned)(p0 | p1);
+        if (!op) continue;
+        const int sx = ppu->spr_x[k];
+        const bool bg_priority = (attr & 0x20) != 0;
+        const uint8_t *const pal = &ppu->palette_ram[0x10 + (attr & 0x03) * 4];
+        scr_pixel_t *const row = &screen_buffer[ppu->scanline * 256];
 
-        for (int px = 0; px < 8; px++) {
-            int draw_x = sx + px;
+        for (int px = 0; px < 8 && op; px++, op = (op << 1) & 0xFFu) {
+            if (!(op & 0x80u)) continue;
+            const int draw_x = sx + px;
             if (draw_x >= 256) break;
+            const int bit = 7 - px;
+            const uint8_t color = (uint8_t)(((p0 >> bit) & 1) | (((p1 >> bit) & 1) << 1));
 
-            uint8_t bit = flip_x ? px : (7 - px);
-            uint8_t color = ((p0 >> bit) & 1) | (((p1 >> bit) & 1) << 1);
-            if (color == 0) continue;
-
-            if (covered[draw_x]) continue;
-            covered[draw_x] = 1;
+            const uint32_t cm = 1u << (draw_x & 31);
+            if (covered[draw_x >> 5] & cm) continue;
+            covered[draw_x >> 5] |= cm;
 
             if (bg_priority && bg_pixels[draw_x] != 0) continue;
 
-            screen_buffer[ppu->scanline * 256 + draw_x] =
-                nes_color_to_1555(ppu->palette_ram[0x10 + (attr & 0x03) * 4 + color]);
+            row[draw_x] = nes_color_to_1555(pal[color]);
         }
     }
 
@@ -1421,6 +1542,7 @@ static void render_scanline(ppu_t *ppu) {
 
 void ppu_init(ppu_t *ppu) {
     memset(ppu, 0, sizeof(*ppu));
+    g_oam_ver++;
     for (int i = 0; i < 32; i++) {
         ppu->palette_ram[i] = nintendo_power_up_palette[i];
     }
@@ -1576,6 +1698,7 @@ void ppu_cpu_write(ppu_t *ppu, uint16_t addr, uint8_t val) {
             }
 #endif
             ppu->oam[ppu->oam_addr++] = val;
+            g_oam_ver++;
             break;
         case 5:
             if (ppu->w == 0) { ppu->t = (ppu->t & ~0x001F) | (val >> 3); ppu->x = val & 0x07; ppu->w = 1; }
@@ -1962,13 +2085,23 @@ static inline __attribute__((always_inline)) uint32_t ppu_sprite_bulk(ppu_t *ppu
          * ilerletir (sprite'lar fast_sprite_line ile cycle 257'de uretilir). Hizli modda cycle 337+ dot-dot kalir
          * (vd==339 blogu ve cift-kare atlamasi icin). */
         uint32_t d;
-        if (cyc >= 4 && cyc <= 255)        d = (uint32_t)(256 - cyc);
-        else if (cyc >= 259 && cyc <= 335) d = (uint32_t)(336 - cyc);
-        else if (cyc >= 337 && !g_ppu_fast_sprites) d = (uint32_t)(341 - cyc);
+        /* cycle 2-3 ve 258: tek ozel is mapper A12 saati (cycle 3: BG=$1000,SPR=$0000; cycle 258: BG=$0000,SPR=$1000).
+         * O desen yoksa bu dot'lar da siradan (sayac + bozunma) ve toplu adima katilir. */
+        const int a12_3   = (ppu->reg_ctrl & 0x10) && !(ppu->reg_ctrl & 0x08);
+        const int a12_258 = !(ppu->reg_ctrl & 0x10) && (ppu->reg_ctrl & 0x08);
+        if ((cyc >= 4 || (cyc >= 2 && !a12_3)) && cyc <= 255) d = (uint32_t)(256 - cyc);
+        else if ((cyc >= 259 || (cyc == 258 && !a12_258)) && cyc <= 335) d = (uint32_t)(336 - cyc);
+        else if (cyc >= 337) {
+            /* 337..340 (sanal dot 340, 0, 1, 2): hizli modda da ozel is yok. vd==339 blogu cycle 336'dadir (toplu yol disi),
+             * cift-kare atlamasi yalniz satir 261'de (burada sl < 240). Satir sonundan sonra bir sonraki satirin cycle 0'i da
+             * (vd 3, ozel is yok) ayni toplu adimda: bir sonraki satir gorunur ve ayni duragan kosullarda ise. */
+            d = (uint32_t)(341 - cyc);
+            if (ppu->scanline + 1 < 240) d++;
+        }
         else return 0;
         if (d > maxd) d = maxd;
         int c2 = cyc + (int)d;
-        if (c2 >= 341) { c2 = 0; ppu->scanline++; }
+        if (c2 >= 341) { c2 -= 341; ppu->scanline++; }
         ppu->cycle = c2;
         ppu_decay_advance(ppu, d);
         return d;
@@ -2239,7 +2372,7 @@ static inline int ppu_bulk_candidate(const ppu_t *ppu)
          * digerlerinde ppu_sprite_bulk 0 doner; bos ppu_bulk cagrilarini onle (eskiden her dot icin 1 donuyordu:
          * SH-4'te ~3-4 ms bosa gidiyor, M2/M4/M9 satirlarini sisiriyordu). */
         const int cf = ppu->cycle;
-        if (g_ppu_fast_sprites) return (cf >= 4 && cf <= 255) || (cf >= 259 && cf <= 335);
+        if (g_ppu_fast_sprites) return (cf >= 2 && cf <= 255) || (cf >= 258 && cf <= 335) || cf >= 337;   /* ust-kume: A12 desenli 2/3/258'de ppu_bulk 0 doner */
         return (cf >= 4 && cf <= 255) || (cf >= 259 && cf <= 335) || cf >= 337;
     }
     const int c = ppu->cycle;
@@ -2327,6 +2460,89 @@ static inline int ppu_dots_to(int s, int c, int line, int cyc)
     return delta + 1;
 }
 
+
+/* ============================================================
+ *  $2002 yoklama atlamasi icin: durum bitleri kac dot boyunca DEGISEMEZ?
+ *  Mevcut konumdan itibaren d <= donus degeri kadar dot ilerletildiginde (a) reg_status & 0xE0 degismez,
+ *  (b) open_bus degismez (bozunma esigi asilmaz), (c) varilan konum $2002 okumasinin ozel davrandigi pencerede
+ *  ((240,340) ve (241,0..3)) degildir. MUHAFAZAKAR alt sinir: degisebilecek her satirin basinda durur.
+ *  Gecerlilik: CPU bu sure boyunca PPU/OAM'e yazmaz (cagiran, dongude baska G/C erisimi olmadigini dogrular).
+ *  Satir kurallari (L = 0..239, h = sprite yuksekligi):
+ *    - sprite 0 carpismasi: render tam acik, bit 6 sifir ve (L == 0 [cop spr0_line] veya OAM[0].y, L'ye +-2 satir
+ *      payla yakin, veya mevcut satirda spr0_line / spr0_hit_cycle)
+ *    - tasma: render acik, bit 5 sifir ve +-2 satir payla menzildeki sprite sayisi >= 8 (donanim hatasi dahil:
+ *      8'den az sprite bulunursa tasma asamasina hic gecilmez) veya mevcut satirda ovf_set_cycle
+ *    - 240: konum (240,340) oncesine kadar; 241: cycle >= 4'ten sonra (bit 7 (241,1) dot'unda kurulur); 242..259 guvenli;
+ *    - 260: sprite bayraklari satir sonundan PPU_SPRITE_FLAG_CLEAR_LEAD dot once, tum bayraklar 261'e geciste temizlenir:
+ *      reg_status & 0xE0 != 0 ise 260 satirinin basinda dur; 261: guvenli (tek karede (261,339) yeniden temizlik, bayraklar
+ *      zaten sifir); 261 satiri 340 dot sayilir (tek kare atlamasi, muhafazakar).
+ * ============================================================ */
+static int pss_count_near(const ppu_t *ppu, int L, int h)
+{
+    int n = 0;
+    for (int i = 0; i < 64; i++) {
+        if ((unsigned)(L - (int)ppu->oam[4 * i] + 2) < (unsigned)(h + 5)) {
+            if (++n >= 8) return n;
+        }
+    }
+    return n;
+}
+
+static int pss_line_unsafe(const ppu_t *ppu, int L, int first)
+{
+    const uint8_t st = ppu->reg_status, m = ppu->reg_mask;
+    const int h = (ppu->reg_ctrl & 0x20) ? 16 : 8;
+
+    if ((m & 0x18) == 0x18 && !(st & 0x40)) {
+        if (L == 0) return 1;
+        if ((unsigned)(L - (int)ppu->oam[0] + 2) < (unsigned)(h + 5)) return 1;
+        if (first && (ppu->spr0_line || ppu->spr0_hit_cycle)) return 1;
+    }
+    if ((m & 0x18) && !(st & 0x20)) {
+        if (first && ppu->ovf_set_cycle) return 1;
+        if (pss_count_near(ppu, L, h) >= 8) return 1;
+    }
+    return 0;
+}
+
+uint32_t ppu_status_stable_dots(const ppu_t *ppu, uint32_t limit)
+{
+    const uint32_t t = ppu->open_bus_decay_timer;
+    const uint32_t dec = (t <= 5369319u) ? 5369319u - t : 0u;
+    if (limit > dec) limit = dec;
+
+    int sl = ppu->scanline, cyc = ppu->cycle, first = 1;
+    uint32_t d = 0;
+
+    while (d < limit) {
+        const int len = (sl == 261) ? 340 : 341;
+        if (cyc >= len) cyc = len - 1;
+        const uint32_t rem = (uint32_t)(len - cyc);
+
+        if (sl < 240) {
+            if (pss_line_unsafe(ppu, sl, first)) break;
+            d += rem;
+        } else if (sl == 240) {
+            if (cyc < 339) d += (uint32_t)(339 - cyc);
+            break;
+        } else if (sl == 241) {
+            if (cyc <= 3) break;
+            d += rem;
+        } else if (sl < 260) {
+            d += rem;
+        } else if (sl == 260) {
+            if (ppu->reg_status & 0xE0) break;
+            d += rem;
+        } else {
+            d += rem;
+        }
+        first = 0;
+        cyc = 0;
+        if (++sl >= 262) sl = 0;
+    }
+    return d < limit ? d : limit;
+}
+
 int ppu_dots_to_next_event(const ppu_t *ppu)
 {
     const int s = ppu->scanline;
@@ -2363,35 +2579,44 @@ int ppu_dots_to_next_event(const ppu_t *ppu)
     return best;
 }
 
+/* NES goruntusu 2 kat buyutulmus (512x480), 640x480 ekranin ortasinda (x = 64..575, y = 0..479).
+ * Hizli yol (yatay ekran, 1555): her satir, her pikseli iki kez iceren 1 KB'lik bir satira acilir (piksel basina bir 32 bit
+ * kelime) ve bu satir store queue ile (libnaomi hw_memcpy: 32 baytlik bloklar) cerceve tamponunda iki satira kopyalanir.
+ * Hedef hizali: tampon basi ve satir (1280 bayt) 32'nin kati, x = 64 piksel = 128 bayt. hw_memcpy kilidi alamazsa
+ * (baska bir is parcacigi store queue kullaniyorsa) ayni satir islemciyle yazilir. */
+#define PPU_X2_X ((640 - 512) / 2)
 void ppu_draw(const ppu_t *ppu) {
     (void)ppu;
-    if (s_blit_mode == 1) {
-        const unsigned w = video_width();
+    if (s_blit_mode == 1 && video_width() == 640 && video_height() == 480) {
+        static uint32_t row2[256] __attribute__((aligned(32)));
         uint16_t *fb = (uint16_t *)video_framebuffer();
-        const unsigned x_off = w - 256 - 20, y_off = 40;   /* x_off cift -> 4 bayt hizali */
-
         for (unsigned y = 0; y < 240; y++) {
-            uint32_t *dst = (uint32_t *)(fb + (y_off + y) * w + x_off);
-            const uint32_t *src = (const uint32_t *)&screen_buffer[y * 256];
-            for (int k = 0; k < 128; k += 4) {
-                dst[k]     = src[k];
-                dst[k + 1] = src[k + 1];
-                dst[k + 2] = src[k + 2];
-                dst[k + 3] = src[k + 3];
+            const uint16_t *src = &screen_buffer[y * 256];
+            for (int k = 0; k < 256; k += 4) {
+                const uint32_t p0 = src[k], p1 = src[k + 1], p2 = src[k + 2], p3 = src[k + 3];
+                row2[k] = p0 | (p0 << 16); row2[k + 1] = p1 | (p1 << 16);
+                row2[k + 2] = p2 | (p2 << 16); row2[k + 3] = p3 | (p3 << 16);
+            }
+            for (unsigned r = 0; r < 2; r++) {
+                uint16_t *dst = fb + (2 * y + r) * 640 + PPU_X2_X;
+                if (!hw_memcpy(dst, row2, sizeof row2)) memcpy(dst, row2, sizeof row2);
             }
         }
         return;
     }
 
-    /* Yedek yol (dikey monitor veya yerlesim uyusmazligi): 16 biti RGB555'ten genislet. */
+    /* Yedek yol (dikey monitor veya yerlesim uyusmazligi): 2 kat, piksel piksel, ortada. */
     {
-        int x_off = video_width() - 256 - 20, y_off = 40;
+        const int x_off = ((int)video_width() - 512) / 2, y_off = ((int)video_height() - 480) / 2;
         for (int y = 0; y < 240; y++) {
             for (int x = 0; x < 256; x++) {
                 uint16_t v = screen_buffer[y * 256 + x];
                 int r = (v >> 10) & 0x1F, g = (v >> 5) & 0x1F, b = v & 0x1F;
-                video_draw_pixel(x_off + x, y_off + y,
-                                 rgb((r << 3) | (r >> 2), (g << 3) | (g >> 2), (b << 3) | (b >> 2)));
+                const color_t c = rgb((r << 3) | (r >> 2), (g << 3) | (g >> 2), (b << 3) | (b >> 2));
+                video_draw_pixel(x_off + 2 * x, y_off + 2 * y, c);
+                video_draw_pixel(x_off + 2 * x + 1, y_off + 2 * y, c);
+                video_draw_pixel(x_off + 2 * x, y_off + 2 * y + 1, c);
+                video_draw_pixel(x_off + 2 * x + 1, y_off + 2 * y + 1, c);
             }
         }
     }

@@ -115,6 +115,8 @@ void ppu_reset(ppu_t *ppu);
 void ppu_step_cycles(ppu_t *ppu, uint32_t cycles);
 void ppu_step_sampled(ppu_t *ppu, uint32_t cycles, uint8_t *nmi_last, int *nmi_pending);
 int ppu_dots_to_next_event(const ppu_t *ppu);
+/* $2002 yoklama atlamasi: mevcut konumdan en fazla 'limit' dot icinde durum bitleri/open_bus degismeden ilerlenebilecek dot sayisi. */
+uint32_t ppu_status_stable_dots(const ppu_t *ppu, uint32_t limit);
 void ppu_draw(const ppu_t *ppu);
 
 /* Hizli mod (EXP_FAST_PPU): sprite hatti satir basina tek seferde hesaplanir. Bit-exact degildir. */
@@ -124,6 +126,10 @@ int  ppu_get_fast_sprites(void);
 /* Kare atlama (EXP_FRAME_SKIP): 1 iken satir ciziciler piksel uretmez (gizli kare); CPU'nun gorebildigi durum degismez. */
 void ppu_set_render_skip(int on);
 int  ppu_get_render_skip(void);
+
+/* Tani sayaclari (bkz. ppu.c). */
+extern unsigned long g_ppu_diag_hidden_lines, g_ppu_diag_dotwise_lines;
+extern const int ppu_built_frame_skip;
 
 /* A/B karsilastirma (ab_core.h): ekranin bir satirinin hash'i ve ekranin kopyasi (256x240, RGB1555). */
 uint32_t ppu_screen_line_hash(int y);
@@ -140,5 +146,8 @@ uint8_t  ppu_core_palette_mirror_index(uint8_t idx);
 #ifdef __cplusplus
 }
 #endif
+
+/* ppu.c: OAM disaridan (kopyalama vb.) degistiyse sprite satir onbellegini gecersiz kil. */
+void ppu_oam_changed(void);
 
 #endif

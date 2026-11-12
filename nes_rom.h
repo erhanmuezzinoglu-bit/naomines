@@ -20,6 +20,12 @@ int nes_rom_load_mapper0(const char *rompath, uint8_t mem_64k[0x10000], ppu_t *p
 /* 8KB PRG bank pointer'ları */
 extern uint8_t *nes_prg_banks[NES_MAX_PRG_BANKS];
 extern int nes_prg_banks_count;
+/* CPU $8000-$FFFF gorunumu (bkz. nes_rom.c): pencere kaynaklari, 32 KB goruntu, degisiklik bayragi ve goruntuyu esleyen islev. */
+extern const uint8_t *nes_prg_page[4];
+extern const uint8_t *nes_prg_img;
+extern int nes_prg_dirty;
+extern unsigned long nes_prg_copies;
+void nes_prg_commit(void);
 
 /* 1KB CHR bank pointer'ları */
 extern uint8_t *nes_chr_banks[NES_MAX_CHR_BANKS];

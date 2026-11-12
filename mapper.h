@@ -14,6 +14,10 @@ void mapper_scanline_clock(void);
 int  mapper_irq_pending(void);
 /* IRQ'nun yukselebilecegi A12 saatinin sirasi (1 = siradaki); 0 = hicbir zaman. PPU olay mesafesi icin. */
 int  mapper_scanline_clocks_until_irq(void);
+int  mapper_ppu_timing_sensitive(void);
+int  mapper_ppu_position_sensitive(void);
+void mapper_refresh_ppu_dep(void);
+extern int g_prgram_ppu_dep;
 
 /* MMC2 initial latch/register state. */
 void mapper_mmc2_setup(void);

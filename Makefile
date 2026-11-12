@@ -10,7 +10,6 @@ SRCS += nes_bus.c
 SRCS += fake6502.c
 SRCS += rom_browser.c
 SRCS += emu_driver.c
-SRCS += debug_hud.c
 SRCS += ppu.c
 SRCS += mapper.c
 

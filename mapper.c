@@ -2,6 +2,14 @@
 #include "nes_rom.h"
 #include <string.h>
 #include <stdbool.h>
+#include "exp_config.h"
+#include "nes_bus.h"
+#if EXP_DIAG_HUD
+extern unsigned long g_diag_k[10];
+#define MDIAGK(i) (g_diag_k[i]++)
+#else
+#define MDIAGK(i) ((void)0)
+#endif
 
 /* MMC3 IRQ state. */
 static int mmc3_irq_pending = 0;
@@ -51,6 +59,7 @@ static void mapper_tags_clear(void);
 void mapper_reset_state(void)
 {
     memset(&g_mapper, 0, sizeof(g_mapper));
+    g_prgram_ppu_dep = 0;
     mapper_tags_clear();
     mmc3_ap_valid = 0;   /* bir sonraki MMC3 guncellemesi tam olsun */
 
@@ -81,7 +90,9 @@ void mapper_reset_state(void)
     /* A53 (Mapper 28). */
     a53_select = 0;
     a53_mode = 0;
-    a53_outer = 0;
+    /* Acilista dis bank = son 32K ($FF): reset vektoru son bankta (NESdev Action 53: acilis durumu son bank olmali;
+     * eskiden 0'di -> Streemerz ilk 32K'dan acilip coküyordu). */
+    a53_outer = 0xFF;
     a53_prg = 0;
     a53_chr = 0;
 }
@@ -126,6 +137,31 @@ int mapper_scanline_clocks_until_irq(void)
     return (int)g_mapper.mmc3_irq_counter;
 }
 
+/* PPU'nun hangi ana senkronlandigi CPU'ya gorunur bir sonucu degistirebilir mi? (emu_driver.c, yazmac erisiminden sonraki zorunlu
+ * PPU senkronu icin.) Iki durum var:
+ *  - MMC3: PPU olay tahmini (ppu_dots_to_next_event) mapper_scanline_clocks_until_irq()'ya bagli; yazmac/mapper erisimi bunu degistirebilir.
+ *  - MMC1 SNROM: PRG-RAM /CE, PPU'nun o anki konumundan (A12 tarafi) hesaplanir ve PPU senkronlanmadan okunur; R1/R2 bit 4 farkliysa
+ *    sonuc PPU'nun son senkron anina baglidir.
+ * Diger mapper'larda PPU olay tahmini yalniz PPUCTRL/PPUMASK'a baglidir ve PPU konumunu okuyan baska bir CPU yolu yoktur. */
+int mapper_ppu_position_sensitive(void)
+{
+    return nes_last_mapper_loaded == 1 && !nes_chr_is_rom && nes_chr_banks_count == 8 &&
+           ((g_mapper.mmc1_chr0 ^ g_mapper.mmc1_chr1) & 0x10u);
+}
+
+/* PRG-RAM'in PPU konumuna bagli oldugu durum (g_prgram_ppu_dep, = mapper_ppu_position_sensitive): bu durumda PRG-RAM erisimleri
+ * erisim aninda PPU'yu senkronlayan yavas yoldan yapilir (nes_bus.c nes_bus_read/write); boylece PPU'nun "son senkron konumu"
+ * hicbir CPU sonucunu etkilemez ve yazmac/mapper erisimlerinden sonra zorunlu senkron gerekmez. Bayrak yalniz mapper yazimi,
+ * yeniden esleme, MMC2 kurulumu ve yuklemede degisebilir (genel giris noktalarinin sonunda yenilenir). */
+int g_prgram_ppu_dep = 0;
+void mapper_refresh_ppu_dep(void) { g_prgram_ppu_dep = mapper_ppu_position_sensitive(); }
+
+int mapper_ppu_timing_sensitive(void)
+{
+    /* Yalniz MMC3: PPU olay tahmini A12 sayacina bagli. SNROM PRG-RAM kurali artik erisim aninda senkronlu (yukari). */
+    return nes_last_mapper_loaded == 4;
+}
+
 int mapper_irq_pending(void)
 {
     if (nes_last_mapper_loaded == 4) {
@@ -157,7 +193,14 @@ static void set_prg_8k(nes_bus_t *bus, uint32_t addr, uint8_t *src)
         const uint32_t w = (addr - 0x8000u) >> 13;
         if (g_prg_tag[w] == src) return;
         g_prg_tag[w] = src;
+#if EXP_PRG_PTR
+        MDIAGK(6);
+        nes_prg_page[w] = src;   /* kopya yok: pencere kaynagi; goruntu genel giris noktasinin sonunda eslenir (PRG_COMMIT) */
+        nes_prg_dirty = 1;
+        return;
+#endif
     }
+    MDIAGK(6);
     memcpy(&bus->mem[addr], src, 8192);
 }
 
@@ -182,6 +225,7 @@ static void set_chr_1k(nes_bus_t *bus, int slot, int bank_1k)
             g_chr_tag[slot] = 0;
         }
     }
+    MDIAGK(7);
     memcpy(&bus->ppu->vram[slot * 1024], nes_chr_banks[bank_1k], 1024);
 }
 
@@ -858,7 +902,7 @@ static void mmc2_write(uint16_t addr, uint8_t value, nes_bus_t *bus)
     }
 }
 
-void mapper_mmc2_setup(void)
+static void mapper_mmc2_setup_impl(void)
 {
     g_mapper.mmc2_prg_bank = 0;
     g_mapper.mmc2_chr_fd0 = 0;
@@ -922,19 +966,21 @@ static void m78_update(nes_bus_t *bus)
  *  M180 — UNROM Crazy (7408)
  *  Same PRG banking as M2 UNROM, different bus behavior.
  * ============================================================ */
+/* Mapper 180 (UNROM'un tersi, Crazy Climber): $8000-$BFFF ILK 16K banka sabit, $C000-$FFFF yazilan banka gecer
+ * (eskiden UNROM gibi eslenirdi: oyun bank yazinca sabit kodu $8000'den kayboluyor, CPU sifir dolu alanda kaliyordu). */
 static void m180_update(nes_bus_t *bus)
 {
     int total_16k = nes_prg_banks_count / 2;
     if (total_16k <= 0) return;
     int bank = g_mapper.unrom_bank % total_16k;
-    set_prg_16k(bus, 0x8000, bank);
-    set_prg_16k(bus, 0xC000, total_16k - 1);
+    set_prg_16k(bus, 0x8000, 0);
+    set_prg_16k(bus, 0xC000, bank);
 }
 
 /* ============================================================
  *  Public API
  * ============================================================ */
-void mapper_map_prg_pages(nes_bus_t *bus)
+static void mapper_map_prg_pages_impl(nes_bus_t *bus)
 {
     if (!bus) return;
     mapper_tags_clear();   /* tam yeniden esleme: etiketler gecersiz */
@@ -1000,7 +1046,7 @@ void mapper_map_prg_pages(nes_bus_t *bus)
     }
 }
 
-void mapper_write(uint16_t addr, uint8_t value, nes_bus_t *bus)
+static void mapper_write_impl(uint16_t addr, uint8_t value, nes_bus_t *bus)
 {
     if (!bus) return;
     if (addr < 0x5000) return;
@@ -1051,20 +1097,22 @@ void mapper_write(uint16_t addr, uint8_t value, nes_bus_t *bus)
             break;
 
                         case 28:
-            if (addr == 0x5000) {
-                /* Register select. Bit 7 write-enable DEĞİL. */
-                a53_select = value;
-            } else if (addr == 0x8000) {
-                /* Data register write. Register indeksi doğrudan
-                 * $00, $01, $80, $81. Maskeleme YOK. */
-                uint8_t reg = a53_select;
-                switch (reg) {
+            /* NESdev Action 53: $5000-$5FFF yazimi register secer (yalniz bit 7 ve bit 0: $00 CHR, $01 ic PRG, $80 kip,
+             * $81 dis PRG); $8000-$FFFF yazimi secili registera yazar. Tek ekran aynalama kiplerinde (kip bit 1 = 0) $00/$01
+             * yazimlarinin bit 4'u ekran sayfasini (kip bit 0) belirler. (Eskiden yalniz tam $5000/$8000 adresleri
+             * taniniyordu: Streemerz menusu oyunu baslatamiyordu.) */
+            if (addr >= 0x5000 && addr < 0x6000) {
+                a53_select = (uint8_t)(value & 0x81);
+            } else if (addr >= 0x8000) {
+                switch (a53_select) {
                     case 0x00: a53_chr   = value; break;
                     case 0x01: a53_prg   = value; break;
                     case 0x80: a53_mode  = value; break;
                     case 0x81: a53_outer = value; break;
                     default: break;
                 }
+                if (a53_select <= 0x01 && !(a53_mode & 0x02))
+                    a53_mode = (uint8_t)((a53_mode & ~0x01) | ((value >> 4) & 0x01));
                 a53_apply(bus);
             }
             break;
@@ -1103,4 +1151,27 @@ void mapper_write(uint16_t addr, uint8_t value, nes_bus_t *bus)
         default:
             break;
     }
+}
+/* Genel giris: PRG pencereleri degistiyse 32 KB goruntuyu esle (bkz. nes_rom.c nes_prg_commit). */
+void mapper_write(uint16_t addr, uint8_t value, nes_bus_t *bus)
+{
+    mapper_write_impl(addr, value, bus);
+    if (nes_prg_dirty) nes_prg_commit();
+    mapper_refresh_ppu_dep();
+}
+
+/* Genel giris: PRG pencereleri degistiyse 32 KB goruntuyu esle (bkz. nes_rom.c nes_prg_commit). */
+void mapper_map_prg_pages(nes_bus_t *bus)
+{
+    mapper_map_prg_pages_impl(bus);
+    if (nes_prg_dirty) nes_prg_commit();
+    mapper_refresh_ppu_dep();
+}
+
+/* Genel giris: PRG pencereleri degistiyse 32 KB goruntuyu esle (bkz. nes_rom.c nes_prg_commit). */
+void mapper_mmc2_setup(void)
+{
+    mapper_mmc2_setup_impl();
+    if (nes_prg_dirty) nes_prg_commit();
+    mapper_refresh_ppu_dep();
 }

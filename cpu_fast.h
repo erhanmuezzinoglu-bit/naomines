@@ -49,8 +49,8 @@ static inline uint8_t cpu_read_fast(fake6502_context *c, uint16_t address)
 
         uint8_t v;
         if (__builtin_expect((uint16_t)(address - 0x2000u) >= 0x6000u, 1)) {   /* RAM ($0000-$1FFF) veya PRG ($8000-$FFFF) */
-            v = (address < 0x2000u) ? bus->mem[address & 0x07FFu] : bus->mem[address];
-        } else if ((uint16_t)(address - 0x6000u) < 0x2000u) {                  /* PRG-RAM ($6000-$7FFF) */
+            v = (address < 0x2000u) ? bus->mem[address & 0x07FFu] : NES_PRG_READ(bus, address);
+        } else if ((uint16_t)(address - 0x6000u) < 0x2000u && !g_prgram_ppu_dep) {   /* PRG-RAM ($6000-$7FFF) */
             v = mapper_prg_ram_enabled(bus) ? bus->cart_sram[address - 0x6000u] : bus->open_bus_value;
             g_write_epoch++;   /* yavas yol her okumada artirirdi: bos dongu tespiti degismesin */
         } else {
@@ -80,7 +80,7 @@ static inline void cpu_write_fast(fake6502_context *c, uint16_t address, uint8_t
 
     if (__builtin_expect(
             bus != 0 &&
-            (address < 0x2000u || (uint16_t)(address - 0x6000u) < 0x2000u) &&   /* RAM veya PRG-RAM */
+            (address < 0x2000u || ((uint16_t)(address - 0x6000u) < 0x2000u && !g_prgram_ppu_dep)) &&   /* RAM veya PRG-RAM */
             bus->apu.dmc.dma_request == 0 &&
             (int32_t)((uint32_t)now - (uint32_t)g_dl_min) < 0 &&
             !CPU_FAST_ABLATE_M7(), 1)) {

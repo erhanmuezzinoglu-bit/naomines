@@ -1,4 +1,6 @@
 #include "nes_rom.h"
+#include "exp_config.h"
+#include "nes_bus.h"
 #include "mapper.h"
 #include <stdio.h>
 #include <string.h>
@@ -6,6 +8,66 @@
 
 /* ---------------- Global değişkenler ---------------- */
 uint8_t *nes_prg_banks[NES_MAX_PRG_BANKS] = {0};
+/* CPU $8000-$FFFF gorunumu.
+ * nes_prg_page[w]: 8 KB pencere w'nin ($8000 + w*$2000) kaynak isaretcisi (mapper.c set_prg_8k degistirir).
+ * nes_prg_img: 64 KB adres duzenli tampon; $8000-$FFFF kismi bu dort pencereye ESIT (alt yarisi kullanilmaz). CPU okumalari
+ * mem[] ile ayni indeksleme: nes_prg_img[adres] (adres >= $8000).
+ * EXP_PRG_PTR 1: goruntuler, pencere dortlusune gore anahtarlanan kucuk bir onbellekte tutulur (nes_prg_commit). Ayni dortluye geri
+ * donen bank degisimi kopyasizdir; yeni dortlu en eski goruntuyu yalniz FARKLI pencereleri kopyalayarak yeniden kullanir.
+ * EXP_PRG_PTR 0: eski davranis (pencereler mem[]'e kopyalanir, goruntu mem[]). */
+static const uint8_t nes_prg_zero_page[0x10000];
+const uint8_t *nes_prg_page[4] = { nes_prg_zero_page, nes_prg_zero_page, nes_prg_zero_page, nes_prg_zero_page };
+const uint8_t *nes_prg_img = nes_prg_zero_page;
+int nes_prg_dirty = 0;
+unsigned long nes_prg_copies = 0;   /* tani: goruntuye yapilan 8 KB pencere kopyasi sayisi */
+#if EXP_PRG_PTR
+#define PRG_IMG_N 8
+static uint8_t prg_img[PRG_IMG_N][0x10000];   /* yalniz $8000-$FFFF yarisi kullanilir */
+static const uint8_t *prg_img_src[PRG_IMG_N][4];
+static unsigned prg_img_age[PRG_IMG_N], prg_age_now;
+static int prg_img_ok[PRG_IMG_N];
+static int prg_cur = -1;
+
+static void nes_prg_cache_clear(void)
+{
+    for (int i = 0; i < PRG_IMG_N; i++) prg_img_ok[i] = 0;
+    prg_cur = -1;
+}
+
+void nes_prg_commit(void)
+{
+    nes_prg_dirty = 0;
+    if (prg_cur >= 0 && prg_img_src[prg_cur][0] == nes_prg_page[0] && prg_img_src[prg_cur][1] == nes_prg_page[1] &&
+        prg_img_src[prg_cur][2] == nes_prg_page[2] && prg_img_src[prg_cur][3] == nes_prg_page[3]) return;
+    int v = -1;
+    for (int i = 0; i < PRG_IMG_N; i++) {
+        if (prg_img_ok[i] && prg_img_src[i][0] == nes_prg_page[0] && prg_img_src[i][1] == nes_prg_page[1] &&
+            prg_img_src[i][2] == nes_prg_page[2] && prg_img_src[i][3] == nes_prg_page[3]) { v = i; break; }
+    }
+    if (v < 0) {
+        /* yeni dortlu: bos ya da en eski goruntu; yalniz farkli pencereleri kopyala */
+        unsigned best = 0;
+        for (int i = 0; i < PRG_IMG_N; i++) {
+            if (!prg_img_ok[i]) { v = i; break; }
+            const unsigned a = prg_age_now - prg_img_age[i];
+            if (v < 0 || a > best) { v = i; best = a; }
+        }
+        for (int w = 0; w < 4; w++) {
+            if (!prg_img_ok[v] || prg_img_src[v][w] != nes_prg_page[w]) {
+                memcpy(&prg_img[v][0x8000 + w * 0x2000], nes_prg_page[w], 0x2000);
+                prg_img_src[v][w] = nes_prg_page[w];
+                nes_prg_copies++;
+            }
+        }
+        prg_img_ok[v] = 1;
+    }
+    prg_img_age[v] = ++prg_age_now;
+    prg_cur = v;
+    nes_prg_img = prg_img[v];
+}
+#else
+void nes_prg_commit(void) { nes_prg_dirty = 0; }
+#endif
 int nes_prg_banks_count = 0;
 
 uint8_t *nes_chr_banks[NES_MAX_CHR_BANKS] = {0};
@@ -173,10 +235,24 @@ static void load_prg(const uint8_t *data, int prg_bytes,
             break;
     }
 
+    /* Pencere icerigi eskiden mem_64k'ya kopyalanirdi; kaynak yoksa (garip boyutlar) pencere mem_64k'nin onceki icerigini gosterirdi.
+     * Ayni davranis: kopya korunur, pencere isaretcisi kaynagi (yoksa mem_64k'daki eski icerigi) gosterir. */
     if (src_8000) memcpy(&mem_64k[0x8000], src_8000, 8192);
     if (src_A000) memcpy(&mem_64k[0xA000], src_A000, 8192);
     if (src_C000) memcpy(&mem_64k[0xC000], src_C000, 8192);
     if (src_E000) memcpy(&mem_64k[0xE000], src_E000, 8192);
+#if EXP_PRG_PTR
+    nes_prg_page[0] = src_8000 ? src_8000 : &mem_64k[0x8000];
+    nes_prg_page[1] = src_A000 ? src_A000 : &mem_64k[0xA000];
+    nes_prg_page[2] = src_C000 ? src_C000 : &mem_64k[0xC000];
+    nes_prg_page[3] = src_E000 ? src_E000 : &mem_64k[0xE000];
+    nes_prg_cache_clear();   /* yeni ROM: eski goruntuler (ayni heap adresleri olabilir) gecersiz */
+    nes_prg_commit();
+#else
+    /* kopyalama kipi: pencereler ve goruntu her zaman mem_64k'yi gosterir */
+    for (int w_ = 0; w_ < 4; w_++) nes_prg_page[w_] = &mem_64k[0x8000 + 0x2000 * w_];
+    nes_prg_img = mem_64k;
+#endif
 }
 
 int nes_rom_load_mapper0(const char *rompath, uint8_t mem_64k[0x10000], ppu_t *ppu)
@@ -284,5 +360,6 @@ int nes_rom_load_mapper0(const char *rompath, uint8_t mem_64k[0x10000], ppu_t *p
     fclose(fp);
     printf("ROM Yuklendi: Mapper %u, PRG 16K:%d, CHR 8K:%d, CHR_IS_ROM=%d\n",
            mapper, prg_banks_16k, chr_banks_8k, nes_chr_is_rom);
+    mapper_refresh_ppu_dep();   /* CHR turu/sayisi ve mapper artik belli */
     return 1;
 }

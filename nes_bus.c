@@ -108,6 +108,10 @@ static uint8_t nes_bus_read_raw(
             &bus->apu, addr, bus->open_bus_value
         );
     }
+    else if (addr >= 0x5000 && addr <= 0x5FFF) {
+        uint8_t m;
+        if (mapper_read_5xxx(addr, &m)) data = m;   /* MMC5 yazmaclari / ExRAM; digerleri acik bus */
+    }
     else if (addr >= 0x6000 && addr <= 0x7FFF) {
         if (mapper_prg_ram_enabled(bus)) {
             data = bus->cart_sram[addr - 0x6000];

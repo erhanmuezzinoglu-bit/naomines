@@ -186,6 +186,12 @@ static void load_prg(const uint8_t *data, int prg_bytes,
             }
             break;
 
+        case 5: /* MMC5: acilista PRG kipi 3, $5114-$5117 = $FF -> dort pencere de son 8 KB (reset vektoru) */
+            if (banks_8k >= 1) {
+                src_8000 = src_A000 = src_C000 = src_E000 = nes_prg_banks[banks_8k - 1];
+            }
+            break;
+
         case 9: /* MMC2: 8KB switchable + last 24KB fixed */
             if (banks_8k >= 4) {
                 src_8000 = nes_prg_banks[0];

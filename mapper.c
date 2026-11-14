@@ -18,6 +18,13 @@ static uint8_t mmc3_ap_regs[8];
 static uint8_t mmc3_ap_mode;
 static uint8_t mmc3_ap_valid;
 
+/* MMC5 (asagida): ileri bildirimler */
+static void m5_reset(void);
+static void m5_scanline(void);
+static int m5_clocks_until_irq(void);
+static uint8_t m5_irq_enable, m5_irq_pending, m5_prot1, m5_prot2;
+static const uint8_t *m5_spr_tag[8];
+
 /* MMC2 bus pointer. mapper_map_prg_pages() bunu bus init'te doldurur. */
 static nes_bus_t *g_mapper_bus = NULL;
 
@@ -56,9 +63,13 @@ static uint8_t a53_chr = 0;      /* register $00 */
  * ============================================================ */
 static void mapper_tags_clear(void);
 
+int g_ppu_mmc2;   /* 1: MMC2 (mapper 9) etkin; PPU desen okumalari mapper_mmc2_ppu_read'e bildirilir */
+
 void mapper_reset_state(void)
 {
     memset(&g_mapper, 0, sizeof(g_mapper));
+    g_ppu_mmc2 = 0;
+    m5_reset();
     g_prgram_ppu_dep = 0;
     mapper_tags_clear();
     mmc3_ap_valid = 0;   /* bir sonraki MMC3 guncellemesi tam olsun */
@@ -119,6 +130,8 @@ void mapper_scanline_clock(void)
 {
     if (nes_last_mapper_loaded == 4) {
         mmc3_clock_irq();
+    } else if (nes_last_mapper_loaded == 5) {
+        m5_scanline();
     }
 }
 
@@ -128,6 +141,7 @@ void mapper_scanline_clock(void)
  * degilse azalir; sayac 0 olunca IRQ. */
 int mapper_scanline_clocks_until_irq(void)
 {
+    if (nes_last_mapper_loaded == 5) return m5_clocks_until_irq();
     if (nes_last_mapper_loaded != 4) return 0;
     if (!g_mapper.mmc3_irq_enable) return 0;
 
@@ -158,14 +172,18 @@ void mapper_refresh_ppu_dep(void) { g_prgram_ppu_dep = mapper_ppu_position_sensi
 
 int mapper_ppu_timing_sensitive(void)
 {
-    /* Yalniz MMC3: PPU olay tahmini A12 sayacina bagli. SNROM PRG-RAM kurali artik erisim aninda senkronlu (yukari). */
-    return nes_last_mapper_loaded == 4;
+    /* MMC3 (A12 sayaci) ve MMC5 (satir IRQ'su): PPU olay tahmini mapper durumuna bagli. SNROM PRG-RAM kurali artik erisim
+     * aninda senkronlu (yukari). */
+    return nes_last_mapper_loaded == 4 || nes_last_mapper_loaded == 5;
 }
 
 int mapper_irq_pending(void)
 {
     if (nes_last_mapper_loaded == 4) {
         return mmc3_irq_pending;
+    }
+    if (nes_last_mapper_loaded == 5) {
+        return m5_irq_pending && m5_irq_enable;
     }
     return 0;
 }
@@ -570,6 +588,10 @@ int mapper_prg_ram_write_enabled(const nes_bus_t *bus)
                ((g_mapper.mmc3_prg_ram & 0x40u) == 0);
     }
 
+    if (nes_last_mapper_loaded == 5) {
+        return m5_prot1 == 2 && m5_prot2 == 1;
+    }
+
     return 1;
 }
 
@@ -806,6 +828,220 @@ static void axrom_update(nes_bus_t *bus)
     }
 }
 
+
+/* ============================================================
+ *  MMC5 (Mapper 5) — Castlevania III
+ *  Kapsam (NesterDC mapper 5 ve NESdev MMC5 sayfasi ornek alindi): PRG kipleri 0-3 ($5100, $5114-$5117; ROM),
+ *  PRG-RAM $6000-$7FFF (8 KB, $5102/$5103 yazma korumasi), CHR kipleri 0-3 ($5101, $5120-$512B), ad tablosu esleme ($5105:
+ *  yatay/dikey/tek ekran), satir IRQ'su ($5203/$5204), carpici ($5205/$5206), ExRAM ($5C00-$5FFF, $5104 kip 0-3 okuma/yazma).
+ *  Yok: genisletilmis ozellik kipi (ExRAM kip 1), ExRAM/doldurma kipi ad tablolari, dikey bolme, MMC5 sesi, $8000-$DFFF'e
+ *  eslenen PRG-RAM. 8x16 sprite'ta BG ve sprite ayri CHR setleri kullanir; burada tek CHR goruntusu oldugu icin son yazilan
+ *  set ikisine birden uygulanir (8x8 sprite'ta donanimin davranisi zaten budur).
+ * ============================================================ */
+int g_ppu_mmc5;                 /* 1: MMC5 etkin (PPU satir saati her satirda cycle 3'te; A12 saati yok) */
+static uint8_t m5_prg_mode, m5_chr_mode, m5_prot1, m5_prot2, m5_exram_mode, m5_nt;
+static uint8_t m5_prg[5];       /* $5113..$5117 */
+static uint8_t m5_chr_a[8], m5_chr_b[4];
+static uint8_t m5_irq_target, m5_irq_enable, m5_irq_pending;
+static uint8_t m5_mul_a, m5_mul_b;
+static uint8_t m5_exram[1024];
+
+static void m5_reset(void)
+{
+    g_ppu_mmc5 = (nes_last_mapper_loaded == 5);
+    m5_prg_mode = 3; m5_chr_mode = 0; m5_prot1 = 0; m5_prot2 = 0; m5_exram_mode = 0; m5_nt = 0x44;
+    m5_prg[0] = 0; m5_prg[1] = 0xFF; m5_prg[2] = 0xFF; m5_prg[3] = 0xFF; m5_prg[4] = 0xFF;
+    for (int i = 0; i < 8; i++) m5_chr_a[i] = (uint8_t)i;
+    for (int i = 0; i < 4; i++) m5_chr_b[i] = (uint8_t)i;
+    { extern const uint8_t *g_ppu_spr_chr; g_ppu_spr_chr = 0; }
+    for (int i = 0; i < 8; i++) m5_spr_tag[i] = 0;
+    m5_irq_target = 0; m5_irq_enable = 0; m5_irq_pending = 0;
+    m5_mul_a = 0xFF; m5_mul_b = 0xFF;
+    memset(m5_exram, 0, sizeof m5_exram);
+}
+
+static uint8_t *m5_bank8(int v)
+{
+    const int n = nes_prg_banks_count;
+    if (n <= 0) return 0;
+    return nes_prg_banks[(v & 0x7F) % n];
+}
+
+static void m5_prg_apply(nes_bus_t *bus)
+{
+    switch (m5_prg_mode & 3) {
+        case 0: {
+            const int b = m5_prg[4] & 0x7C;
+            set_prg_8k(bus, 0x8000, m5_bank8(b + 0)); set_prg_8k(bus, 0xA000, m5_bank8(b + 1));
+            set_prg_8k(bus, 0xC000, m5_bank8(b + 2)); set_prg_8k(bus, 0xE000, m5_bank8(b + 3));
+            break;
+        }
+        case 1: {
+            const int b0 = m5_prg[2] & 0x7E, b1 = m5_prg[4] & 0x7E;
+            set_prg_8k(bus, 0x8000, m5_bank8(b0)); set_prg_8k(bus, 0xA000, m5_bank8(b0 + 1));
+            set_prg_8k(bus, 0xC000, m5_bank8(b1)); set_prg_8k(bus, 0xE000, m5_bank8(b1 + 1));
+            break;
+        }
+        case 2: {
+            const int b0 = m5_prg[2] & 0x7E;
+            set_prg_8k(bus, 0x8000, m5_bank8(b0)); set_prg_8k(bus, 0xA000, m5_bank8(b0 + 1));
+            set_prg_8k(bus, 0xC000, m5_bank8(m5_prg[3])); set_prg_8k(bus, 0xE000, m5_bank8(m5_prg[4]));
+            break;
+        }
+        default:
+            set_prg_8k(bus, 0x8000, m5_bank8(m5_prg[1])); set_prg_8k(bus, 0xA000, m5_bank8(m5_prg[2]));
+            set_prg_8k(bus, 0xC000, m5_bank8(m5_prg[3])); set_prg_8k(bus, 0xE000, m5_bank8(m5_prg[4]));
+            break;
+    }
+}
+
+/* CHR: A seti ($5120-$5127) ve B seti ($5128-$512B, 1 KB kipte yuvalar 0-3 ve 4-7 icin ayni dort yazmac). Donanim: 8x8
+ * sprite'ta tum okumalar A setini kullanir; 8x16 sprite'ta arka plan B, sprite'lar A setini kullanir (Castlevania III 8x16
+ * kullanir). PPU tek CHR goruntusu (vram) tuttugu icin 8x16'da sprite'lar icin ayri bir goruntu (m5_spr_chr) kurulur ve PPU'ya
+ * g_ppu_spr_chr ile verilir. ($2007 ile CPU'nun CHR okumasinda "son yazilan set" kurali uygulanmaz: arka plan goruntusu.) */
+extern const uint8_t *g_ppu_spr_chr;
+static uint8_t m5_spr_chr[8192];
+static const uint8_t *m5_spr_tag[8];
+
+static void m5_banks(int set_b, int bank[8])
+{
+    if (!set_b) {
+        switch (m5_chr_mode & 3) {
+            case 0: for (int i = 0; i < 8; i++) bank[i] = m5_chr_a[7] * 8 + i; break;
+            case 1: for (int i = 0; i < 4; i++) { bank[i] = m5_chr_a[3] * 4 + i; bank[4 + i] = m5_chr_a[7] * 4 + i; } break;
+            case 2: for (int i = 0; i < 4; i++) { bank[2 * i] = m5_chr_a[2 * i + 1] * 2; bank[2 * i + 1] = m5_chr_a[2 * i + 1] * 2 + 1; } break;
+            default: for (int i = 0; i < 8; i++) bank[i] = m5_chr_a[i]; break;
+        }
+    } else {
+        switch (m5_chr_mode & 3) {
+            case 0: for (int i = 0; i < 8; i++) bank[i] = m5_chr_b[3] * 8 + i; break;
+            case 1: for (int i = 0; i < 4; i++) { bank[i] = m5_chr_b[3] * 4 + i; bank[4 + i] = m5_chr_b[3] * 4 + i; } break;
+            case 2: for (int i = 0; i < 4; i++) { const int r = m5_chr_b[(i & 1) * 2 + 1]; bank[2 * i] = r * 2; bank[2 * i + 1] = r * 2 + 1; } break;
+            default: for (int i = 0; i < 8; i++) bank[i] = m5_chr_b[i & 3]; break;
+        }
+    }
+}
+
+static void m5_chr_apply(nes_bus_t *bus)
+{
+    if (!bus || !bus->ppu || !nes_chr_is_rom) return;
+    const int n = nes_chr_banks_count;
+    if (n <= 0) return;
+    const int large = (bus->ppu->reg_ctrl & 0x20) != 0;
+    int bg[8], sp[8];
+    m5_banks(large, bg);
+    for (int i = 0; i < 8; i++) set_chr_1k(bus, i, ((bg[i] % n) + n) % n);
+    if (large) {
+        m5_banks(0, sp);
+        for (int i = 0; i < 8; i++) {
+            const uint8_t *src = nes_chr_banks[((sp[i] % n) + n) % n];
+            if (src && m5_spr_tag[i] != src) { memcpy(&m5_spr_chr[i * 1024], src, 1024); m5_spr_tag[i] = src; }
+        }
+        g_ppu_spr_chr = m5_spr_chr;
+    } else {
+        g_ppu_spr_chr = 0;
+    }
+}
+
+/* PPU: $2000 sprite boyutu (bit 5) degisti. */
+void mapper_mmc5_sprite_size_changed(void)
+{
+    if (nes_last_mapper_loaded == 5) m5_chr_apply(g_mapper_bus);
+}
+
+static void m5_nt_apply(nes_bus_t *bus)
+{
+    if (!bus || !bus->ppu) return;
+    /* $5105: ad tablosu basina 2 bit (0: CIRAM A, 1: CIRAM B, 2: ExRAM, 3: doldurma). Mevcut PPU aynalama kiplerine eslenir. */
+    const uint8_t v = m5_nt;
+    const int n0 = v & 3, n1 = (v >> 2) & 3, n2 = (v >> 4) & 3, n3 = (v >> 6) & 3;
+    uint8_t mir;
+    if (n0 == n1 && n2 == n3 && n0 != n2) mir = 0;          /* yatay */
+    else if (n0 == n2 && n1 == n3 && n0 != n1) mir = 1;     /* dikey */
+    else if (n0 == n1 && n1 == n2 && n2 == n3) mir = (n0 & 1) ? 3 : 2;   /* tek ekran */
+    else mir = (n1 & 1) ? 1 : 0;
+    bus->ppu->mirroring = mir;
+}
+
+static void m5_irq_update(void)
+{
+    if (m5_irq_pending && m5_irq_enable) emu_driver_request_irq();
+    else emu_driver_clear_irq();
+}
+
+static void m5_write(uint16_t addr, uint8_t value, nes_bus_t *bus)
+{
+    if (addr >= 0x5C00 && addr < 0x6000) { if (m5_exram_mode != 3) m5_exram[addr - 0x5C00] = value; return; }
+    switch (addr) {
+        case 0x5100: m5_prg_mode = value & 3; m5_prg_apply(bus); break;
+        case 0x5101: m5_chr_mode = value & 3; m5_chr_apply(bus); break;
+        case 0x5102: m5_prot1 = value & 3; break;
+        case 0x5103: m5_prot2 = value & 3; break;
+        case 0x5104: m5_exram_mode = value & 3; break;
+        case 0x5105: m5_nt = value; m5_nt_apply(bus); break;
+        case 0x5113: m5_prg[0] = value; break;
+        case 0x5114: case 0x5115: case 0x5116: case 0x5117:
+            m5_prg[addr - 0x5113] = value; m5_prg_apply(bus); break;
+        case 0x5120: case 0x5121: case 0x5122: case 0x5123:
+        case 0x5124: case 0x5125: case 0x5126: case 0x5127:
+            m5_chr_a[addr - 0x5120] = value; m5_chr_apply(bus); break;
+        case 0x5128: case 0x5129: case 0x512A: case 0x512B:
+            m5_chr_b[addr - 0x5128] = value; m5_chr_apply(bus); break;
+        case 0x5203: m5_irq_target = value; break;
+        case 0x5204: m5_irq_enable = value & 0x80; m5_irq_update(); break;
+        case 0x5205: m5_mul_a = value; break;
+        case 0x5206: m5_mul_b = value; break;
+        default: break;   /* $5000-$5015 ses, $5106/$5107 doldurma, $5130, $5200-$5202 bolme: yok */
+    }
+}
+
+/* $5000-$5FFF okumasi; ele alindiysa 1. (nes_bus_read bu alanda PPU'yu once senkronlar.) */
+int mapper_read_5xxx(uint16_t addr, uint8_t *out)
+{
+    if (nes_last_mapper_loaded != 5) return 0;
+    if (addr == 0x5204) {
+        const ppu_t *p = g_mapper_bus ? g_mapper_bus->ppu : 0;
+        const int in_frame = p && (p->reg_mask & 0x18) && p->scanline < 240;
+        *out = (uint8_t)((m5_irq_pending ? 0x80 : 0) | (in_frame ? 0x40 : 0));
+        m5_irq_pending = 0;
+        emu_driver_clear_irq();
+        return 1;
+    }
+    if (addr == 0x5205) { *out = (uint8_t)((m5_mul_a * m5_mul_b) & 0xFF); return 1; }
+    if (addr == 0x5206) { *out = (uint8_t)((m5_mul_a * m5_mul_b) >> 8); return 1; }
+    if (addr >= 0x5C00 && addr < 0x6000 && m5_exram_mode >= 2) { *out = m5_exram[addr - 0x5C00]; return 1; }
+    return 0;
+}
+
+/* Satir saati (PPU, render satirlarinda cycle 3): satir s, $5203 ile esitse IRQ bekler (satir 0 tetiklemez). NESdev'deki sayac
+ * (cerceve icinde her satir +1, 0'dan) satir numarasina esit oldugu icin dogrudan satir kullanilir. */
+static void m5_scanline(void)
+{
+    const ppu_t *p = g_mapper_bus ? g_mapper_bus->ppu : 0;
+    if (!p) return;
+    const int s = p->scanline;
+    if (s >= 240 || s == 0) return;
+    if (s == m5_irq_target) {
+        m5_irq_pending = 1;
+        if (m5_irq_enable) emu_driver_request_irq();
+    }
+}
+
+/* PPU olay tahmini: siradaki satir saatinden (1) itibaren kacinci saatte IRQ yukselir; 0 = hic. */
+static int m5_clocks_until_irq(void)
+{
+    const ppu_t *p = g_mapper_bus ? g_mapper_bus->ppu : 0;
+    if (!p || !m5_irq_enable || m5_irq_target == 0 || m5_irq_target >= 240) return 0;
+    const int s = p->scanline, c = p->cycle;
+    /* siradaki saat satiri (render satirlari sirasi 261 -> 0..239; idx(261) = 0, idx(L) = L + 1) */
+    int line;
+    if ((s < 240 || s == 261) && c <= 3) line = s;
+    else { line = (s + 1) % 262; while (!(line < 240 || line == 261)) line = (line + 1) % 262; }
+    const int idx = (line == 261) ? 0 : line + 1;
+    const int tidx = m5_irq_target + 1;
+    return ((tidx - idx + 241) % 241) + 1;
+}
+
 /* ============================================================
  *  MMC2 (Mapper 9) — Punch-Out
  * ============================================================ */
@@ -902,6 +1138,24 @@ static void mmc2_write(uint16_t addr, uint8_t value, nes_bus_t *bus)
     }
 }
 
+/* MMC2 latch: PPU $0FD8 / $0FE8 okuyunca latch 0, $1FD8-$1FDF / $1FE8-$1FEF okuyunca latch 1 FD / FE olur; degisen
+ * latch'in sectigi 4 KB CHR bankasi sonraki okumalardan itibaren gecerlidir (o okumanin kendisi eski bankadan). Daha once hic
+ * uygulanmiyordu (latch'ler hep FE kaliyordu): Punch-Out!! seyirci ve yazilarinda bozulma. */
+void mapper_mmc2_ppu_read(uint16_t addr)
+{
+    uint8_t l0 = g_mapper.mmc2_latch0, l1 = g_mapper.mmc2_latch1;
+    addr &= 0x1FFF;
+    if (addr == 0x0FD8) l0 = 0xFD;
+    else if (addr == 0x0FE8) l0 = 0xFE;
+    else if ((addr & 0x1FF8) == 0x1FD8) l1 = 0xFD;
+    else if ((addr & 0x1FF8) == 0x1FE8) l1 = 0xFE;
+    else return;
+    if (l0 == g_mapper.mmc2_latch0 && l1 == g_mapper.mmc2_latch1) return;
+    g_mapper.mmc2_latch0 = l0;
+    g_mapper.mmc2_latch1 = l1;
+    mmc2_apply_active_chr(g_mapper_bus);
+}
+
 static void mapper_mmc2_setup_impl(void)
 {
     g_mapper.mmc2_prg_bank = 0;
@@ -911,6 +1165,7 @@ static void mapper_mmc2_setup_impl(void)
     g_mapper.mmc2_chr_fe1 = 0;
     g_mapper.mmc2_latch0 = 0xFE;
     g_mapper.mmc2_latch1 = 0xFE;
+    g_ppu_mmc2 = 1;
 
     if (g_mapper_bus) {
         mmc2_apply_prg(g_mapper_bus);
@@ -1012,6 +1267,13 @@ static void mapper_map_prg_pages_impl(nes_bus_t *bus)
             axrom_update(bus);
             break;
 
+        case 5:
+            g_ppu_mmc5 = 1;
+            m5_prg_apply(bus);
+            m5_chr_apply(bus);
+            m5_nt_apply(bus);
+            break;
+
         case 9:
             mmc2_apply_prg(bus);
             mmc2_apply_active_chr(bus);
@@ -1082,6 +1344,10 @@ static void mapper_write_impl(uint16_t addr, uint8_t value, nes_bus_t *bus)
                 g_mapper.axrom_bank = value & 0x1F;
                 axrom_update(bus);
             }
+            break;
+
+        case 5:
+            if (addr < 0x6000) m5_write(addr, value, bus);
             break;
 
         case 9:

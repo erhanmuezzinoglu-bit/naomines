@@ -262,6 +262,12 @@ static void triangle_clock_length(triangle_t *t, uint8_t halt)
 
 static uint8_t triangle_output(const triangle_t *t)
 {
+#if EXP_APU_TRI_HOLD
+    /* Donanim: ucgen kanali susturuldugunda (uzunluk/dogrusal sayac 0, $4015 kapali) dizici yalnizca DURUR; DAC son degeri
+     * vermeye devam eder (0'a dusmez). 0'a zorlamak her nota sonunda bir basamak (tik) ve dogrusal olmayan karistiricida
+     * gurultu/DMC seviyesinde ani degisim uretir. CPU'ya gorunmez (yalniz ses cikisi). */
+    return triangle_sequence[t->duty_step];
+#endif
     if (!t->enabled ||
         t->length_counter == 0 ||
         t->linear_counter == 0) {
@@ -456,10 +462,12 @@ static void dmc_clock_timer(apu_t *apu)
         d->timer_reloaded_this_cycle = 1;
 
         if (d->bit_count > 0) {
-            if (d->shift_register & 1) {
-                if (d->value <= 125) d->value += 2;
-            } else {
-                if (d->value >= 2) d->value -= 2;
+            if (!d->silence || !EXP_APU_DMC_SILENCE) {   /* sessizlik bayragi: ornek tamponu bos baslayan cikis turunda seviye degismez */
+                if (d->shift_register & 1) {
+                    if (d->value <= 125) d->value += 2;
+                } else {
+                    if (d->value >= 2) d->value -= 2;
+                }
             }
             d->shift_register >>= 1;
             d->bit_count--;
@@ -467,6 +475,7 @@ static void dmc_clock_timer(apu_t *apu)
 
         if (d->bit_count == 0) {
             d->bit_count = 8;
+            d->silence = !d->buffer_full;
 
             if (d->buffer_full) {
                 d->shift_register = d->sample_buffer;
@@ -613,6 +622,7 @@ void apu_init(apu_t *apu)
     apu->dmc.timer = apu->dmc.timer_period;
     apu->dmc.bit_count = 8;
     apu->dmc.shift_register = 0;
+    apu->dmc.silence = 1;
 
     apu->dmc.sample_address = 0xC000;
     apu->dmc.current_address = 0xC000;
@@ -665,6 +675,7 @@ void apu_reset(apu_t *apu)
     apu->dmc.timer = apu->dmc.timer_period;
     apu->dmc.bit_count = 8;
     apu->dmc.shift_register = 0;
+    apu->dmc.silence = 1;
 
     apu->noise.shift_register = 1;
     apu->dmc.irq_pending = 0;
@@ -876,10 +887,12 @@ static inline uint32_t timer_bulk(uint16_t *timer, uint16_t period, uint32_t m)
  * toplu ilerletme (timer_bulk) zaten yeniden yuklemistir. */
 static inline void dmc_simple_reload(dmc_t *d)
 {
-    if (d->shift_register & 1) {
-        if (d->value <= 125) d->value += 2;
-    } else {
-        if (d->value >= 2) d->value -= 2;
+    if (!d->silence || !EXP_APU_DMC_SILENCE) {
+        if (d->shift_register & 1) {
+            if (d->value <= 125) d->value += 2;
+        } else {
+            if (d->value >= 2) d->value -= 2;
+        }
     }
     d->shift_register >>= 1;
     d->bit_count--;

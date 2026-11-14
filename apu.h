@@ -112,6 +112,8 @@ typedef struct {
     uint8_t loop_implicit_delay;
 
     uint8_t timer_reloaded_this_cycle;
+
+    uint8_t silence;   /* cikis birimi sessizlik bayragi: bayt sonunda ornek tamponu bossa 1; 1 iken cikis seviyesi degismez */
 } dmc_t;
 
 typedef struct {

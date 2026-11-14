@@ -50,12 +50,28 @@ static unsigned g_oam_ver = 1;
 #define PS_STAT(x) ((void)0)
 #include <naomi/video.h>
 #include <naomi/system.h>   /* hw_memcpy (store queue) */
+#if EXP_TA_DRAW
+#include <naomi/ta.h>
+#include <naomi/timer.h>
+#include <naomi/thread.h>
+#include <stdio.h>
+#include <stdarg.h>
+#endif
 #include <string.h>
 #include <stdbool.h>
 
 /* Mapper kancaları (mapper.c). */
 extern void mapper_scanline_clock(void);
 extern int mapper_scanline_clocks_until_irq(void);
+/* MMC2 (mapper 9, Punch-Out!!) latch: desen ust bayt okumalari mapper'a bildirilir (bkz. mapper.c mapper_mmc2_ppu_read).
+ * Etkinken BG her satir render_bg_row ile (karo karo, sirayla) cizilir; gizli karelerde de latch icin okunur. */
+extern int g_ppu_mmc2;
+void mapper_mmc2_ppu_read(uint16_t addr);
+/* MMC5 (mapper 5): satir IRQ'su icin her render satirinda cycle 3'te mapper saati; A12 (pattern tablosu) saati kullanilmaz. */
+extern int g_ppu_mmc5;
+void mapper_mmc5_sprite_size_changed(void);
+/* Sprite desenleri icin ayri CHR goruntusu (MMC5 8x16: arka plan ve sprite farkli bankalar); NULL ise vram. */
+const uint8_t *g_ppu_spr_chr;
 #if EXP_DIAG_PROF
 int g_ppu_shadow_active = 0;   /* olcum kipi: golge PPU adimlanirken mapper saati ve ekran yazimi bastirilir */
 /* olcum kipi ablasyonu (yalniz golge PPU'da): 1 = sprite degerlendirme (fast_sprite_line) atlanir, 2 = satir cizimi (render_scanline) atlanir.
@@ -245,6 +261,7 @@ int ppu_blit_mode(void) { return s_blit_mode; }
 
 static void ppu_a12_check(uint16_t old_v, uint16_t new_v)
 {
+    if (g_ppu_mmc5) return;
     if ((old_v ^ new_v) & 0x1000) {
         if (new_v & 0x1000)
             MAPPER_CLOCK();
@@ -256,6 +273,7 @@ static inline bool ppu_rendering_line(const ppu_t *ppu)
     return (ppu->reg_mask & 0x18) &&
            (ppu->scanline < 240 || ppu->scanline == 261);
 }
+
 
 static inline uint8_t rev8(uint8_t b)
 {
@@ -464,8 +482,12 @@ static void sprite_load_slot(ppu_t *ppu, int sl, int k)
     ppu->spr_valid[k] = 1;
     ppu->spr_x[k]     = x;
     ppu->spr_attr[k]  = attr;
-    ppu->spr_lo[k]    = ppu->vram[addr & 0x1FFF];
-    ppu->spr_hi[k]    = ppu->vram[(addr + 8) & 0x1FFF];
+    {
+        const uint8_t *const chr = g_ppu_spr_chr ? g_ppu_spr_chr : ppu->vram;
+        ppu->spr_lo[k]    = chr[addr & 0x1FFF];
+        ppu->spr_hi[k]    = chr[(addr + 8) & 0x1FFF];
+    }
+    if (g_ppu_mmc2) mapper_mmc2_ppu_read((uint16_t)(addr + 8));
 
     {
         uint8_t l = ppu->spr_lo[k], h = ppu->spr_hi[k];
@@ -742,6 +764,7 @@ static void render_bg_row(ppu_t *ppu, uint8_t bg_pixels[256], int draw, int forc
             p0 = ppu->vram[ppu_core_vram_mask(la, ppu->mirroring)];
         }
         uint8_t p1 = ppu->vram[ppu_core_vram_mask((uint16_t)(p_addr + 8), ppu->mirroring)];
+        if (g_ppu_mmc2) mapper_mmc2_ppu_read((uint16_t)(p_addr + 8));
 
         for (int dot = 0; dot < 8; dot++) {
             int px = (tile * 8) + dot - fine_x;
@@ -755,6 +778,10 @@ static void render_bg_row(ppu_t *ppu, uint8_t bg_pixels[256], int draw, int forc
             }
         }
         v_inc_coarse_x(&v);
+    }
+    if (g_ppu_mmc2) {   /* donanim satirda 34 karo okur (33'u gorunur alanda): 34. karonun ust bayti da latch'i tetikler */
+        const uint8_t t = ppu->vram[ppu_core_vram_mask((uint16_t)(0x2000 | (v & 0x0FFF)), ppu->mirroring)];
+        mapper_mmc2_ppu_read((uint16_t)(bg_base + t * 16 + ((v >> 12) & 7) + 8));
     }
 }
 
@@ -896,6 +923,13 @@ static inline uint8_t bgx_pat(const ppu_t *p, uint16_t base, uint8_t nt, uint16_
     uint16_t a = (uint16_t)(base + nt * 16 + ((v >> 12) & 7) + (hi ? 8 : 0));
     return p->vram[ppu_core_vram_mask(a, p->mirroring)];
 }
+/* gercek (cizim) okumasi: MMC2 latch'ini tetikler. bgx_pat ise veri yolu degeri tahmininde de kullanilir (tetiklemez). */
+static inline uint8_t bgx_pat_hi_fetch(const ppu_t *p, uint16_t base, uint8_t nt, uint16_t v)
+{
+    const uint8_t b = bgx_pat(p, base, nt, v, 1);
+    if (g_ppu_mmc2) mapper_mmc2_ppu_read((uint16_t)(base + nt * 16 + ((v >> 12) & 7) + 8));
+    return b;
+}
 
 static inline void bg_reload(ppu_bgstate_t *bs)
 {
@@ -922,7 +956,7 @@ static void bg_standard_start(const ppu_t *ppu, ppu_bgstate_t *bs)
         nt = bgx_nt(ppu, v);
         bgx_at(ppu, v, &pal[i], &raw);
         lo[i] = bgx_pat(ppu, base, nt, v, 0);
-        hi[i] = bgx_pat(ppu, base, nt, v, 1);
+        hi[i] = bgx_pat_hi_fetch(ppu, base, nt, v);
         v_inc_coarse_x(&v);
     }
     bs->lo  = (uint16_t)((lo[0] << 8) | lo[1]);
@@ -998,7 +1032,7 @@ static void render_line_dotwise(ppu_t *ppu, int draw, int *hit_x)
                     bs.plo = ppu->vram[ppu_core_vram_mask((uint16_t)((pa & 0xFF00) | bs.praw), ppu->mirroring)];
                 }
             } else if (ph == 7) {
-                bs.phi = bgx_pat(ppu, base, bs.nt, bs.v, 1);
+                bs.phi = bgx_pat_hi_fetch(ppu, base, bs.nt, bs.v);
                 v_inc_coarse_x(&bs.v);
             }
         }
@@ -1462,6 +1496,16 @@ static void render_scanline(ppu_t *ppu) {
 #if EXP_FRAME_SKIP || EXP_DIAG_PROF
     if (g_ppu_render_skip) {
         g_ppu_diag_hidden_lines++;
+        if (g_ppu_mmc2) {   /* MMC2: latch durumu icin BG okumalari gizli karede de yapilir */
+            uint8_t bgbuf[264] __attribute__((aligned(4)));
+            render_bg_row(ppu, bgbuf, 0, 0);
+            if ((ppu->reg_mask & 0x18) == 0x18 && ppu->spr_valid[0] && ppu->spr0_line) {
+                const bool lclip = !(ppu->reg_mask & 0x02) || !(ppu->reg_mask & 0x04);
+                if (spr0_line_hit(ppu, bgbuf, lclip)) ppu->reg_status |= 0x40;
+            }
+            sps_end_of_fast_line(ppu);
+            return;
+        }
         /* GIZLI KARE: piksel yok. Yalnizca sprite 0 carpismasi hesaplanir (normal yolun k == 0 mantigi AYNEN). */
         if ((ppu->reg_mask & 0x18) == 0x18 && ppu->spr_valid[0] && ppu->spr0_line) {
             uint8_t bgbuf[264] __attribute__((aligned(4)));
@@ -1487,7 +1531,7 @@ static void render_scanline(ppu_t *ppu) {
         for (int k = 0; k < 8; k++) any_valid |= ppu->spr_valid[k];
     }
 
-    if ((ppu->reg_mask & 0x08) && ppu->bg_ev_count == 0) {
+    if ((ppu->reg_mask & 0x08) && ppu->bg_ev_count == 0 && !g_ppu_mmc2) {
         bg_pixels = bgbuf + render_bg_line_fast(ppu, any_valid ? bgbuf : NULL);
     } else {
         render_bg_row(ppu, bgbuf, 1, 0);
@@ -1678,7 +1722,9 @@ void ppu_cpu_write(ppu_t *ppu, uint16_t addr, uint8_t val) {
     switch (addr & 7) {
         case 0: {
             /* DÜZELTME: nmi_requested set bloğu tamamen kaldırıldı */
+            const uint8_t old_ctrl = ppu->reg_ctrl;
             ppu->reg_ctrl = val;
+            if (g_ppu_mmc5 && ((old_ctrl ^ val) & 0x20)) mapper_mmc5_sprite_size_changed();
             ppu->t = (ppu->t & ~0x0C00) | ((val & 0x03) << 10);
         } break;
         case 1: {
@@ -1800,8 +1846,9 @@ static inline __attribute__((always_inline)) void ppu_dot(ppu_t *ppu) {
                 if (cyc == 258 || cyc == 3) {
                     const int bg_bit  = (ppu->reg_ctrl & 0x10) ? 1 : 0;
                     const int spr_bit = (ppu->reg_ctrl & 0x08) ? 1 : 0;
-                    if ((bg_bit == 0 && spr_bit == 1 && cyc == 258) ||
-                        (bg_bit == 1 && spr_bit == 0 && cyc == 3))
+                    if (g_ppu_mmc5 ? (cyc == 3) :
+                        ((bg_bit == 0 && spr_bit == 1 && cyc == 258) ||
+                         (bg_bit == 1 && spr_bit == 0 && cyc == 3)))
                         MAPPER_CLOCK();
                 } else if (cyc == 256) {
                     v_inc_y(&ppu->v);
@@ -1997,8 +2044,9 @@ static inline __attribute__((always_inline)) void ppu_dot(ppu_t *ppu) {
             int bg_bit  = (ppu->reg_ctrl & 0x10) ? 1 : 0;
             int spr_bit = (ppu->reg_ctrl & 0x08) ? 1 : 0;
 
-            if ((bg_bit == 0 && spr_bit == 1 && ppu->cycle == 258) ||
-                (bg_bit == 1 && spr_bit == 0 && ppu->cycle == 3))
+            if (g_ppu_mmc5 ? (ppu->cycle == 3) :
+                ((bg_bit == 0 && spr_bit == 1 && ppu->cycle == 258) ||
+                 (bg_bit == 1 && spr_bit == 0 && ppu->cycle == 3)))
                 MAPPER_CLOCK();
         }
 
@@ -2553,7 +2601,7 @@ int ppu_dots_to_next_event(const ppu_t *ppu)
     if (ppu->reg_mask & 0x18) {
         const int bgb = (ppu->reg_ctrl & 0x10) != 0;
         const int spb = (ppu->reg_ctrl & 0x08) != 0;
-        const int t = (!bgb && spb) ? 258 : ((bgb && !spb) ? 3 : -1);
+        const int t = g_ppu_mmc5 ? 3 : ((!bgb && spb) ? 258 : ((bgb && !spb) ? 3 : -1));
 
         if (t >= 0) {
             /* CPU'ya gorunen A12 olayi = IRQ'nun yukselebilecegi saat (mapper_scanline_clocks_until_irq). Aradaki saatler
@@ -2580,16 +2628,16 @@ int ppu_dots_to_next_event(const ppu_t *ppu)
 }
 
 /* NES goruntusu 2 kat buyutulmus (512x480), 640x480 ekranin ortasinda (x = 64..575, y = 0..479).
- * Hizli yol (yatay ekran, 1555): her satir, her pikseli iki kez iceren 1 KB'lik bir satira acilir (piksel basina bir 32 bit
- * kelime) ve bu satir store queue ile (libnaomi hw_memcpy: 32 baytlik bloklar) cerceve tamponunda iki satira kopyalanir.
- * Hedef hizali: tampon basi ve satir (1280 bayt) 32'nin kati, x = 64 piksel = 128 bayt. hw_memcpy kilidi alamazsa
- * (baska bir is parcacigi store queue kullaniyorsa) ayni satir islemciyle yazilir. */
+ * Hizli yol (yatay ekran, 1555): her kaynak piksel, iki ekran pikseli olan bir 32 bit kelime olarak iki ekran satirina
+ * yazilir (x = 64 piksel = 128 bayt, hizali). EXP_BLIT_SQ 1: satir once 1 KB'lik ara bellege acilir ve libnaomi hw_memcpy
+ * (store queue) ile iki satira kopyalanir (Flycast'te islemci yazimindan yavas olculdu: 2x cizim ~4,8 ms). */
 #define PPU_X2_X ((640 - 512) / 2)
 void ppu_draw(const ppu_t *ppu) {
     (void)ppu;
     if (s_blit_mode == 1 && video_width() == 640 && video_height() == 480) {
-        static uint32_t row2[256] __attribute__((aligned(32)));
         uint16_t *fb = (uint16_t *)video_framebuffer();
+#if EXP_BLIT_SQ
+        static uint32_t row2[256] __attribute__((aligned(32)));
         for (unsigned y = 0; y < 240; y++) {
             const uint16_t *src = &screen_buffer[y * 256];
             for (int k = 0; k < 256; k += 4) {
@@ -2602,6 +2650,20 @@ void ppu_draw(const ppu_t *ppu) {
                 if (!hw_memcpy(dst, row2, sizeof row2)) memcpy(dst, row2, sizeof row2);
             }
         }
+#else
+        for (unsigned y = 0; y < 240; y++) {
+            const uint32_t *src = (const uint32_t *)&screen_buffer[y * 256];   /* iki piksel / kelime */
+            volatile uint32_t *d0 = (volatile uint32_t *)(fb + (2 * y) * 640 + PPU_X2_X);
+            volatile uint32_t *d1 = d0 + 320;
+            for (int k = 0; k < 128; k++) {
+                const uint32_t w = src[k];
+                const uint32_t lo = w & 0xFFFFu, hi = w >> 16;      /* little-endian: once soldaki piksel */
+                const uint32_t a = lo | (lo << 16), b = hi | (hi << 16);
+                d0[2 * k] = a; d0[2 * k + 1] = b;
+                d1[2 * k] = a; d1[2 * k + 1] = b;
+            }
+        }
+#endif
         return;
     }
 
@@ -2621,3 +2683,276 @@ void ppu_draw(const ppu_t *ppu) {
         }
     }
 }
+
+#if EXP_TA_DRAW
+/* TA (Tile Accelerator) ile cizim: 256x240 NES karesi, 256x256'lik dogrusal (karistirilmamis, ARGB1555) bir dokuya kopyalanir
+ * ve ekranin ortasina 512x480'lik tek bir opak dortgen olarak cizdirilir; 2 kat buyutme (en yakin piksel) ve arka planin
+ * temizlenmesi PVR'da yapilir. Kopyada her piksele alfa biti (bit 15) eklenir (opak liste alfayi zaten yok sayar). ta_render
+ * cizim bitene kadar beklediginden tek doku yeterli (bir sonraki yukleme onceki cizimden sonra). Ust yazi (fps) cagiran
+ * tarafindan ta_render'dan SONRA cerceve tamponuna yazilir. */
+static void *s_ta_texmem;
+static texture_description_t *s_ta_tex;
+static int s_ta_failed;
+
+/* ---- TA yazisi ----
+ * Flycast (ve PS4'teki Naomi emulatoru) TA ile cizilmis bir kareyi dogrudan gosterir; ta_render'dan sonra islemcinin cerceve
+ * tamponuna yazdiklari (video_draw_debug_text) o karede gorunmez. Bu yuzden TA ile cizilen karelerdeki yazilar da TA ile cizilir:
+ * libnaomi'nin 8x8 yazi tipi ilk kullanimda cerceve tamponuna cizilip geri okunarak 128x128'lik bir ARGB4444 dokuya (16x6 karakter)
+ * alinir; her karakter, saydam listede renkle carpilan (modulate) 8x8'lik bir dortgendir. Yazilar kare boyunca tt_text ile
+ * biriktirilir ve ppu_draw_ta tarafindan oyun dortgeninden sonra gonderilir. TA kullanilamazsa tt_flush_fb ayni yazilari
+ * cerceve tamponuna yazar. */
+#define TT_MAX 24
+#define TT_LEN 112
+typedef struct { int16_t x, y; color_t c; char s[TT_LEN]; } tt_item_t;
+static tt_item_t s_tt[TT_MAX];
+static int s_tt_n;
+static void *s_tt_texmem;
+static texture_description_t *s_tt_tex;
+static int s_tt_state;   /* 0: hazirlanmadi, 1: hazir, -1: kullanilamaz */
+
+void tt_text(int x, int y, color_t c, const char *fmt, ...)
+{
+    if (s_tt_n >= TT_MAX) return;
+    tt_item_t *t = &s_tt[s_tt_n++];
+    t->x = (int16_t)x; t->y = (int16_t)y; t->c = c;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(t->s, TT_LEN, fmt, ap);
+    va_end(ap);
+}
+
+void tt_flush_fb(void)
+{
+    for (int i = 0; i < s_tt_n; i++) video_draw_debug_text(s_tt[i].x, s_tt[i].y, s_tt[i].c, "%s", s_tt[i].s);
+    s_tt_n = 0;
+}
+
+/* Yazi tipi dokusu: karakterler cerceve tamponunun (arka tampon; hemen ardindan ta_render tamamen uzerine cizer) sol ustune
+ * siyah zemin uzerine beyaz cizilir ve video_get_pixel ile okunur. */
+static void tt_init(void)
+{
+    s_tt_state = -1;
+    s_tt_texmem = ta_texture_malloc(128, 16);
+    if (!s_tt_texmem) return;
+    s_tt_tex = ta_texture_desc_direct(s_tt_texmem, 128, TA_TEXTUREMODE_ARGB4444);
+    if (!s_tt_tex) return;
+    s_tt_tex->texture_mode |= TA_TEXTUREMODE_NON_TWIDDLED;
+    volatile uint16_t *tex = (volatile uint16_t *)s_tt_texmem;
+    for (int i = 0; i < 128 * 128; i++) tex[i] = 0;
+    video_fill_box(0, 0, 127, 47, rgb(0, 0, 0));
+    for (int g = 0; g < 96; g++) video_draw_debug_character((g & 15) * 8, (g >> 4) * 8, rgb(255, 255, 255), (char)(0x20 + g));
+    for (int y = 0; y < 48; y++)
+        for (int x = 0; x < 128; x++) {
+            const color_t p = video_get_pixel(x, y);
+            if (p.r > 128) tex[y * 128 + x] = 0xFFFF;
+        }
+    s_tt_state = 1;
+}
+
+/* Biriken yazilari saydam listeye gonder (ta_commit_begin/end icinde cagrilir). Tek cokgen basligi; her karakter 4 koseli bir seritti. */
+static void tt_submit(void)
+{
+    struct polygon_list_packed_color p;
+    struct vertex_list_packed_color_32bit_uv v;
+    p.cmd = TA_CMD_POLYGON | TA_CMD_POLYGON_TYPE_TRANSPARENT | TA_CMD_POLYGON_SUBLIST | TA_CMD_POLYGON_STRIPLENGTH_2 |
+            TA_CMD_POLYGON_PACKED_COLOR | TA_CMD_POLYGON_TEXTURED;
+    p.mode1 = TA_POLYMODE1_Z_GREATEREQUAL | TA_POLYMODE1_CULL_DISABLED;
+    p.mode2 = TA_POLYMODE2_MIPMAP_D_1_00 | TA_POLYMODE2_TEXTURE_MODULATE | s_tt_tex->uvsize | TA_POLYMODE2_TEXTURE_CLAMP_U |
+              TA_POLYMODE2_TEXTURE_CLAMP_V | TA_POLYMODE2_FOG_DISABLED | TA_POLYMODE2_SRC_BLEND_SRC_ALPHA |
+              TA_POLYMODE2_DST_BLEND_INV_SRC_ALPHA;
+    p.texture = s_tt_tex->texture_mode | TA_TEXTUREMODE_ADDRESS(s_tt_tex->vram_location);
+    p.not_used[0] = p.not_used[1] = p.not_used[2] = p.not_used[3] = 0;
+    ta_commit_list(&p, TA_LIST_SHORT);
+    const float W = (float)video_width();
+    for (int i = 0; i < s_tt_n; i++) {
+        const tt_item_t *t = &s_tt[i];
+        const unsigned int col = 0xFF000000u | ((unsigned)t->c.r << 16) | ((unsigned)t->c.g << 8) | t->c.b;
+        int tx = t->x, ty = t->y;
+        for (const char *c = t->s; *c; c++) {
+            const int ch = (unsigned char)*c;
+            if (ch == '\n') { tx = t->x; ty += 8; continue; }
+            if (ch > 0x20 && ch < 0x80) {
+                const int g = ch - 0x20;
+                const float x0 = (float)tx, y0 = (float)ty, x1 = x0 + 8.0f, y1 = y0 + 8.0f;
+                const float u0 = (float)((g & 15) * 8) / 128.0f, v0 = (float)((g >> 4) * 8) / 128.0f;
+                const float u1 = u0 + 8.0f / 128.0f, v1 = v0 + 8.0f / 128.0f;
+                v.mult_color = col; v.add_color = 0; v.z = 2.0f;
+                v.cmd = TA_CMD_VERTEX;
+                v.x = x0; v.y = y1; v.u = u0; v.v = v1; ta_commit_list(&v, TA_LIST_SHORT);   /* sol alt */
+                v.x = x0; v.y = y0; v.u = u0; v.v = v0; ta_commit_list(&v, TA_LIST_SHORT);   /* sol ust */
+                v.x = x1; v.y = y1; v.u = u1; v.v = v1; ta_commit_list(&v, TA_LIST_SHORT);   /* sag alt */
+                v.cmd = TA_CMD_VERTEX | TA_CMD_VERTEX_END_OF_STRIP;
+                v.x = x1; v.y = y0; v.u = u1; v.v = v0; ta_commit_list(&v, TA_LIST_SHORT);   /* sag ust */
+            }
+            tx += 8;
+            if ((float)(tx + 8) >= W) { tx = 0; ty += 8; }
+        }
+    }
+}
+
+/* Son ppu_draw_ta adimlarinin suresi (us): doku kopyasi, liste gonderimi (oyun + yazi), ta_render (PVR cizimi bekleme;
+ * EXP_TA_ASYNC'te ppu_ta_wait'in son bekleyisi). */
+unsigned long g_ta_us_copy, g_ta_us_list, g_ta_us_render;
+
+#if EXP_TA_ASYNC
+#include <naomi/interrupt.h>
+/* ta_render (cizimi baslatir ve PVR bitirene kadar cagiran thread'i uyutur) ayri bir thread'de calisir; ana thread beklemez.
+ * Tetikleme: thread bir bayragi thread_sleep(250 us) ile yoklar. (libnaomi semaforu sinyal olarak kullanilamiyor:
+ * semaphore_init ust siniri baslangic degerine esitler ve 0'dan baslayan semaforda release bekleyen thread'i uyandirmadi;
+ * Flycast'te olculdu: thread semaforda kaldi.) Bitis bir bayrakla bildirilir; ana thread en fazla TA_WAIT_US bekler, sure
+ * asilirsa thread birakilir ve senkron ta_render'a donulur (ekranda nedeni yazilir). */
+#define TA_WAIT_US 200000
+static uint32_t s_ta_tid;
+static volatile int s_ta_mode;        /* 0: kurulmadi, 1: calisiyor, -1: kesmeler kapali, -2: zaman asimi, -3: olusturulamadi */
+static volatile int s_ta_busy;        /* baslatilmis, henuz bitmemis cizim */
+static volatile int s_ta_stage;       /* thread: 1 = tetiklendi, ta_render cagrildi; 2 = ta_render dondu */
+static volatile int s_ta_flag;        /* tetikleme bayragi */
+static int s_ta_fail_stage;
+static unsigned long s_ta_go, s_ta_done;
+static volatile int s_ta_gen;         /* thread kusagi: zaman asiminda artar, eski thread ortak duruma dokunmaz */
+unsigned long g_ta_timeouts;          /* zaman asimi sayisi (her birinde yeni thread kurulur; TA_MAX_RETRY'dan sonra senkron) */
+#define TA_MAX_RETRY 8
+
+static void *ta_render_thread(void *param)
+{
+    const int gen = (int)(intptr_t)param;
+    for (;;) {
+        while (!s_ta_flag && gen == s_ta_gen) thread_sleep(250);
+        if (s_ta_mode != 1 || gen != s_ta_gen) break;   /* birakilmis thread: ortak duruma dokunma */
+        s_ta_flag = 0;
+        s_ta_stage = 1;
+        ta_render();
+        if (s_ta_mode != 1 || gen != s_ta_gen) break;
+        s_ta_stage = 2;
+        s_ta_done++;
+        s_ta_busy = 0;
+    }
+    for (;;) thread_sleep(1000000);
+    return 0;
+}
+
+static void ta_thr_init(void)
+{
+    const uint32_t sr = irq_disable();
+    irq_restore(sr);
+    if (sr & 0x10000000) { s_ta_mode = -1; return; }   /* kesmeler kapali: thread beklemesi calismaz */
+    s_ta_flag = 0;
+    s_ta_mode = 1;
+    s_ta_tid = thread_create("ta_render", ta_render_thread, (void *)(intptr_t)s_ta_gen);
+    if (!s_ta_tid) { s_ta_mode = -3; return; }
+    thread_priority(s_ta_tid, 10);   /* ana thread'den (0) yuksek: uyandiginda hemen ta_render'i baslatir */
+    thread_start(s_ta_tid);
+}
+
+/* 0: asenkron calisiyor (veya henuz baslamadi); <0: cizim senkron (-1 kesmeler kapali, -2 zaman asimi, -3 thread yok). */
+int ppu_ta_async_status(int *stage)
+{
+    if (stage) *stage = s_ta_fail_stage;
+    return s_ta_mode >= 0 ? 0 : s_ta_mode;
+}
+
+/* Kisa tani metni (bench sonuc ekrani). */
+void ppu_ta_async_diag(char *buf, int n)
+{
+    const char *r = s_ta_mode == 1 ? "acik" : s_ta_mode == -1 ? "kesme kapali" : s_ta_mode == -3 ? "yok" :
+                    s_ta_mode == -2 ? (s_ta_fail_stage == 0 ? "asim0" : s_ta_fail_stage == 1 ? "asim1" : "asim2") : "-";
+    snprintf(buf, n, "thread:%s g%lu r%lu", r, s_ta_go, s_ta_done);
+}
+#endif
+
+/* Baslatilmis TA cizimi varsa bitmesini bekle. Cerceve tamponuna yazmadan, tampon degistirmeden (video_display_on_vblank)
+ * ve yeni TA listesi gondermeden once cagrilmali (PVR liste tamponunu ve arka tamponu kullaniyor). */
+void ppu_ta_wait(void)
+{
+#if EXP_TA_ASYNC
+    if (!s_ta_busy) return;
+    const int h = profile_start();
+    const int tm = timer_start(TA_WAIT_US);
+    unsigned long spins = 0;
+    while (s_ta_busy) {
+        thread_yield();
+        spins++;
+        if (tm >= 0 ? timer_left(tm) == 0 : spins > 2000000ul) {
+            /* zaman asimi: bu thread'i birak (kusak artar). Hic baslamadiysa liste hazir: simdi senkron ciz. Yeni bir thread
+             * kurulur; TA_MAX_RETRY asimdan sonra kalici olarak senkron cizime donulur. (Eskiden ilk asimda kalici senkron
+             * oluyordu: cizim ~4,4 ms + daha yavas; sonraki tum oyunlar yavasliyordu.) */
+            const int st = s_ta_stage;
+            s_ta_fail_stage = st;
+            g_ta_timeouts++;
+            s_ta_gen++;
+            thread_stop(s_ta_tid);
+            if (st == 0) ta_render();
+            s_ta_busy = 0;
+            s_ta_flag = 0;
+            if (g_ta_timeouts < TA_MAX_RETRY) ta_thr_init();
+            else s_ta_mode = -2;
+            break;
+        }
+    }
+    if (tm >= 0) timer_stop(tm);
+    g_ta_us_render += (unsigned long)profile_end(h);   /* toplanir; okuyan sifirlar */
+#endif
+}
+
+int ppu_draw_ta(void)
+{
+    ppu_ta_wait();
+    if (s_ta_failed) { tt_flush_fb(); return 0; }
+    if (!s_ta_tex) {
+        s_ta_texmem = ta_texture_malloc(256, 16);
+        if (s_ta_texmem) s_ta_tex = ta_texture_desc_direct(s_ta_texmem, 256, TA_TEXTUREMODE_ARGB1555);
+        if (!s_ta_tex) { s_ta_failed = 1; tt_flush_fb(); return 0; }
+        s_ta_tex->texture_mode |= TA_TEXTUREMODE_NON_TWIDDLED;
+    }
+    if (s_tt_state == 0) tt_init();
+    int h = profile_start();
+    {
+        volatile uint32_t *dst = (volatile uint32_t *)s_ta_texmem;
+        const uint32_t *src = (const uint32_t *)screen_buffer;
+        for (int i = 0; i < 240 * 128; i += 4) {
+            dst[i]     = src[i]     | 0x80008000u;
+            dst[i + 1] = src[i + 1] | 0x80008000u;
+            dst[i + 2] = src[i + 2] | 0x80008000u;
+            dst[i + 3] = src[i + 3] | 0x80008000u;
+        }
+    }
+    g_ta_us_copy = (unsigned long)profile_end(h);
+    h = profile_start();
+    {
+        const float x0 = (float)((video_width() - 512) / 2), y0 = (float)((video_height() - 480) / 2);
+        const float vmax = 240.0f / 256.0f;
+        textured_vertex_t q[4] = {
+            { x0,          y0 + 480.0f, 1.0f, 0.0f, vmax },
+            { x0,          y0,          1.0f, 0.0f, 0.0f },
+            { x0 + 512.0f, y0,          1.0f, 1.0f, 0.0f },
+            { x0 + 512.0f, y0 + 480.0f, 1.0f, 1.0f, vmax },
+        };
+        ta_commit_begin();
+        ta_draw_quad(TA_CMD_POLYGON_TYPE_OPAQUE, q, s_ta_tex);
+        ta_commit_end();
+        if (s_tt_n > 0 && s_tt_state == 1) {   /* libnaomi: her ta_commit_begin/end bolumunde tek liste turu */
+            ta_commit_begin();
+            tt_submit();
+            ta_commit_end();
+        }
+    }
+    g_ta_us_list = (unsigned long)profile_end(h);
+#if EXP_TA_ASYNC
+    if (s_ta_mode == 0) ta_thr_init();
+    if (s_ta_mode == 1 && s_tt_state == 1) {   /* (yazi dokusu yoksa yazilar ta_render'dan sonra cizilmeli: senkron) */
+        s_ta_stage = 0;
+        s_ta_busy = 1;
+        s_ta_go++;
+        s_ta_flag = 1;
+        s_tt_n = 0;
+        return 1;
+    }
+#endif
+    h = profile_start();
+    ta_render();
+    g_ta_us_render += (unsigned long)profile_end(h);
+    if (s_tt_state != 1) tt_flush_fb();   /* yazi dokusu yoksa: ta_render'dan sonra cerceve tamponuna (gercek donanimda gorunur) */
+    s_tt_n = 0;
+    return 1;
+}
+#endif

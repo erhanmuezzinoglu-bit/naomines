@@ -149,5 +149,23 @@ uint8_t  ppu_core_palette_mirror_index(uint8_t idx);
 
 /* ppu.c: OAM disaridan (kopyalama vb.) degistiyse sprite satir onbellegini gecersiz kil. */
 void ppu_oam_changed(void);
+/* EXP_TA_DRAW: NES karesini TA ile ciz (doku + 2x dortgen + ta_render). Basarisizsa 0 (cagiran ppu_draw kullanir). */
+int ppu_draw_ta(void);
+#include "exp_config.h"
+#if EXP_TA_DRAW
+#include <naomi/color.h>
+/* TA ile cizilen karede yazi (Flycast'te ta_render'dan sonra cerceve tamponuna yazilan gorunmez): kare boyunca biriktirilir,
+ * ppu_draw_ta oyun goruntusunun ustune cizer. tt_flush_fb: biriktirilenleri cerceve tamponuna yazar (TA kullanilmayan kare). */
+void tt_text(int x, int y, color_t c, const char *fmt, ...) __attribute__((format(printf, 4, 5)));
+void tt_flush_fb(void);
+/* EXP_TA_ASYNC: baslatilmis TA cizimini bekle (cerceve tamponuna yazmadan / tampon degistirmeden once). Diger kipte bos. */
+void ppu_ta_wait(void);
+#if EXP_TA_ASYNC
+int ppu_ta_async_status(int *stage);   /* 0: asenkron; <0: senkrona donuldu (-1 kesmeler kapali, -2 zaman asimi, -3 thread yok) */
+void ppu_ta_async_diag(char *buf, int n);   /* tani metni (bench sonuc ekrani) */
+extern unsigned long g_ta_timeouts;          /* TA thread zaman asimi sayisi */
+#endif
+extern unsigned long g_ta_us_copy, g_ta_us_list, g_ta_us_render;
+#endif
 
 #endif

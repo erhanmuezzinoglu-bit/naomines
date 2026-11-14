@@ -21,6 +21,13 @@ extern int g_prgram_ppu_dep;
 
 /* MMC2 initial latch/register state. */
 void mapper_mmc2_setup(void);
+/* MMC2: PPU desen okumasi (latch tetikleme). g_ppu_mmc2 1 iken PPU her desen ust bayt okumasinda cagirir. */
+extern int g_ppu_mmc2;
+/* MMC5: satir IRQ'su icin PPU satir saati (A12 yerine her render satirinda cycle 3) ve $5000-$5FFF okumalari. */
+extern int g_ppu_mmc5;
+int mapper_read_5xxx(uint16_t addr, uint8_t *out);
+void mapper_mmc5_sprite_size_changed(void);
+void mapper_mmc2_ppu_read(uint16_t addr);
 
 /* PRG-RAM erişim izinleri. */
 int mapper_prg_ram_enabled(const nes_bus_t *bus);

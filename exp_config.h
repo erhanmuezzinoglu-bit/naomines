@@ -8,7 +8,7 @@
 /* Acilista sprite modu. 1: HIZLI (varsayilan): oynanista ~2-4 ms daha hizli; sprite tasma bayragi / $2004 okuma / OAM
  * bozulmasi gibi ince donanim davranislari ve fetch penceresi icindeki CHR degisimi taklit edilmez. 0: DOGRULUK
  * (AccuracyCoin 146/146, blargg testleri); agir oyunlarda (ornek Castlevania) 30 fps'i tutamayabilir. Calisirken B3 dugmesi ile
- * degistirilir. Testler icin B3 ile "ppu:dogru" yapin. */
+ * degistirilir (EXP_B3_HOLD_MS basili tutarak). Testler icin B3 ile DOGRULUK moduna gecin (sol ustte "DOGRU"). */
 #ifndef EXP_FAST_PPU
 #define EXP_FAST_PPU 1
 #endif
@@ -18,13 +18,18 @@
 #ifndef EXP_MENU_HOLD_MS
 #define EXP_MENU_HOLD_MS 3000
 #endif
+/* B3 (PPU modu: HIZLI <-> DOGRULUK) bu kadar milisaniye basili tutulunca degisir (yanlislikla basmaya karsi). Her oyun
+ * EXP_FAST_PPU moduyla baslar. DOGRULUK modunda sol ustte kirmizi "DOGRU" yazar. */
+#ifndef EXP_B3_HOLD_MS
+#define EXP_B3_HOLD_MS 1000
+#endif
 
 /* 1: menuden secilen oyun B4'e basmadan hemen calisir (B4 duraklatma/surdurme olarak kalir). 0: eski davranis. */
 /* OTOMATIK OLCUM (BENCH): 1 = acilista main.c'deki oyun listesini sirayla, girdisiz ve soguk baslangictan calistirir (emulasyon
  * belirlenimci: her derlemede ayni sahneler), sonunda tek ekranlik sonuc tablosu gosterir; START ile normal menuye gecilir.
  * EXP_BENCH_WARM/EXP_BENCH_LOOPS: oyun basina isinma ve olcum dongusu sayisi (dongu = 1 + EXP_BENCH_SKIP NES karesi). */
 #ifndef EXP_BENCH
-#define EXP_BENCH 0
+#define EXP_BENCH 1
 #endif
 #ifndef EXP_BENCH_WARM
 #define EXP_BENCH_WARM 300
@@ -72,6 +77,12 @@
 #ifndef EXP_AUTO_SKIP
 #define EXP_AUTO_SKIP 1
 #endif
+/* EXP_AUTO_SKIP: sonraki dongunun kare sayisi = bu dongunun surdugu vblank sayisi (kayipsiz; oyun ve ses hizi dogru). Ek olarak,
+ * tahmini is n-1 kareyle (n-1) vblank'e bu payla (us) sigiyorsa bir "deneme" dongusunde kare sayisi bir azaltilir (bir kare
+ * kaybedilir); basarisiz denemeden sonra deneme araligi iki katina cikar. */
+#ifndef EXP_SKIP_MARGIN_DOWN
+#define EXP_SKIP_MARGIN_DOWN 1200
+#endif
 /* Bench (EXP_BENCH) dongusundeki SABIT gizli kare sayisi (dongu = 1 + EXP_BENCH_SKIP kare). Olcumlerin onceki turlarla
  * karsilastirilabilmesi icin 1. 0'dan buyukse EXP_FRAME_SKIP de 0'dan buyuk olmali (gizli kare destegi). */
 #ifndef EXP_BENCH_SKIP
@@ -86,15 +97,40 @@
  * (duyulmaz); boylece NES kare hizi (60,10 Hz) ile ekran yenilemesi arasindaki fark ve dongu titresimi tamponu ne
  * bosaltir (takilma) ne tasirir. 0: ornekler oldugu gibi yazilir (eski davranis). */
 /* 1 = arka plan rengi libnaomi'ye KAYDEDILMEZ: her vblank'teki 600 KB tam ekran doldurma ve tampon degisimi sonrasi yeniden
- * cizim kalkar (dongu basina ~2-3 ms). Menude ve gecislerde ekran tam temizlenir, oyunda yalniz sol ustteki fps kutusu.
- * Bir onceki denemede (goruntu islemciyle yazilirken) oyun ekrani emulatorde guncellenmemisti; goruntu artik store queue
- * (hw_memcpy) ile yazildigi icin yeniden deneniyor. Oyun ekrani gelmezse 0 yapin (libnaomi doldurur, eski davranis). */
+ * cizim kalkar. Flycast'te bu kipte oyun ekrani guncellenmiyor (iki denemede de); 0 = libnaomi doldurur (onerilen). */
 #ifndef EXP_BG_MANUAL
 #define EXP_BG_MANUAL 0
+#endif
+/* 1 = oyun ekrani TA (Tile Accelerator) ile cizilir: NES karesi 256x256 dokuya kopyalanir (yaklasik eski 1x cizim kadar),
+ * 2 kat buyutme ve arka plan temizligi PVR'da yapilir; libnaomi'nin tam ekran doldurmasi ve tampon degisimi sonrasi
+ * yeniden cizim gerekmez (EXP_BG_MANUAL/EXP_DRAW_EARLY oyun ekraninda kullanilmaz). Sorun cikarsa 0 (islemciyle 2x cizim). */
+#ifndef EXP_TA_DRAW
+#define EXP_TA_DRAW 1
+#endif
+/* 1 (EXP_TA_DRAW ile): PVR cizimi (ta_render) ayri bir libnaomi thread'inde beklenir; ana dongu cizim bitmesini beklemeden
+ * sonraki karelerin emulasyonuna gecer (Flycast olcumu: ta_render beklemesi ~4.4 ms). Kare tampon degisiminden hemen sonra
+ * baslatilir, bir sonraki degisimde gosterilir: ekrandaki goruntu bir dongu geriden gelir. 0: ta_render cizim bitene kadar bekler. */
+#ifndef EXP_TA_ASYNC
+#define EXP_TA_ASYNC 1
+#endif
+/* 1 (EXP_BG_MANUAL 0 iken): NES karesi dongu basina YALNIZ BIR KEZ, tampon degisiminden hemen sonra cizilir (2x cizim
+ * maliyeti yarilanir; ekrandaki kare bir dongu, yani 1-3 NES karesi kadar geriden gelir). 0: iki cizim (eski). */
+#ifndef EXP_DRAW_EARLY
+#define EXP_DRAW_EARLY 1
+#endif
+/* 2x goruntu cizimi: 0 = islemci (32 bit yazim), 1 = libnaomi hw_memcpy (store queue; Flycast'te yavas olculdu). */
+#ifndef EXP_BLIT_SQ
+#define EXP_BLIT_SQ 0
 #endif
 /* 1 = oyun sirasinda sol ustteki fps'e ek olarak iki tani satiri (ms dokumu, kare/dongu, ses tamponu). */
 #ifndef EXP_HUD_DETAIL
 #define EXP_HUD_DETAIL 0
+#endif
+/* 1 = fps'in altinda dongu basina ortalama NES karesi ("x1.0": her kare cizilir, 60 Hz; "x2.0": iki karede bir).
+ * 2 = ek olarak kare sayisi kararinin tahminleri (ms): F sabit is, d cizilen kare, h gizli kare; a: kare azaltma denemesi,
+ * s: basarisiz deneme; ses: o hedef, c kapasite, b bosalma, t tasma, p butun parti atilan. 0 = kapali. */
+#ifndef EXP_HUD_NFR
+#define EXP_HUD_NFR 0
 #endif
 
 #ifndef EXP_AUDIO_RING
@@ -110,6 +146,23 @@
  * tahmin edilir. Derleme "__audio_exchange_command" bulunamadi hatasi verirse 0 yapin. */
 #ifndef EXP_AUDIO_HWPOS
 #define EXP_AUDIO_HWPOS 1
+#endif
+/* 1 (EXP_AUDIO_HWPOS ile) = ses orneklerini libnaomi'nin halka tamponuna DOGRUDAN yaz (adresler libnaomi'den bir kez alinir):
+ * libnaomi yaziminin cagri basina 2 konum sorgusu ve ornek basina modulo bolmesi kalkar (Flycast'te yazim 1,1-1,8 ms olculdu).
+ * Ses bozulursa 0 (libnaomi audio_write_stereo_data). */
+#ifndef EXP_AUDIO_DIRECT
+#define EXP_AUDIO_DIRECT 1
+#endif
+/* APU SES CIKISI (CPU'ya gorunmez; AccuracyCoin'i etkilemez):
+ *   EXP_APU_DMC_SILENCE 1: DMC sessizlik bayragi (ornek tamponu bosken cikis seviyesi degismez; donanim). 0: eski davranis
+ *     (seviye her bitte 2 azalir; $4011'e her karede yazan oyunlarda, ornek Super Mario Bros, 60 Hz ugultu).
+ *   EXP_APU_TRI_HOLD 1: susturulan ucgen kanali son degerini verir (donanim). 0: eski davranis (0'a zorlanir; nota
+ *     sonlarinda tik). */
+#ifndef EXP_APU_DMC_SILENCE
+#define EXP_APU_DMC_SILENCE 1
+#endif
+#ifndef EXP_APU_TRI_HOLD
+#define EXP_APU_TRI_HOLD 1
 #endif
 
 #if EXP_FRAME_SKIP > 0 && EXP_TURBO_FRAMES > 1
@@ -161,7 +214,7 @@
  * kopyalarin mapper saati / IRQ / ekran yan etkileri bastirilir); yalniz golge kiplerinde fps duser. EXP_DIAG_HUD'u acar.
  * Dorduncu tani satiri: bkz. main.c. */
 #ifndef EXP_DIAG_PROF
-#define EXP_DIAG_PROF 0
+#define EXP_DIAG_PROF 1
 #endif
 #if EXP_DIAG_PROF
 #undef EXP_DIAG_HUD
